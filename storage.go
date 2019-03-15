@@ -1,6 +1,8 @@
-package main
+package goscheduler
 
 type Storage interface {
-	SaveSchedule() error
-	GetSchedule() error
+	GetAll() (jobs []*Job)
+	GetJob(id string) error
+	InsertJob(job *Job) error
+	RemoveJOb(id string) error
 }
