@@ -7,10 +7,12 @@ import (
 
 // generate id from random hex
 func generateID(size int) string {
-	bytes := make([]byte, size)
-	if _, err := rand.Read(bytes); err != nil {
+	if size < 0 {
 		return ""
 	}
+
+	bytes := make([]byte, size)
+	rand.Read(bytes)
 
 	return fmt.Sprintf("%x", bytes)
 }

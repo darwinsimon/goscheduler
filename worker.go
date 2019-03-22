@@ -1,172 +1,137 @@
 package goscheduler
 
 import (
-	"bufio"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"log"
 	"net"
-	"strings"
 	"time"
+
+	"github.com/darwinsimon/goscheduler/command"
 )
 
+// A Worker interface provides all functions for job consumer
 type Worker interface {
-	Start() error
-	Stop() error
-	Register(name string, f WorkerFunc)
+	Register(channel string, f WorkerFunc)
+	Close()
 }
 
 type worker struct {
-	name      string
-	storage   Storage
-	conn      net.Conn
-	isRunning bool
-	funcs     map[string]WorkerFunc
-	reply     chan string
+	addr     string
+	storage  Storage
+	protocol *Protocol
+
+	logger logger
+	logLvl LogLevel
+
+	funcs map[string]WorkerFunc
 }
 
-// WorkerFunc represents callback function for a job
+// WorkerConfig contains every configuration to create a new Worker
+type WorkerConfig struct {
+	Storage Storage
+
+	Address string
+
+	Logger logger
+	LogLvl LogLevel
+
+	ReadDeadline  time.Duration
+	WriteDeadline time.Duration
+}
+
+// WorkerFunc represents callback function for a specific channel
 type WorkerFunc func(job *Job) error
 
 // NewWorker create new worker
-func NewWorker(schedulerAddress string) (Worker, error) {
+func NewWorker(config WorkerConfig) (Worker, error) {
 
-	conn, err := net.Dial("tcp", schedulerAddress)
+	conn, err := net.Dial("tcp", config.Address)
 	if err != nil {
 		return nil, err
 	}
 
 	w := &worker{
-		name:  generateID(5),
+		addr: conn.LocalAddr().String(),
+
+		storage: config.Storage,
+
+		logger: config.Logger,
+		logLvl: config.LogLvl,
+
 		funcs: map[string]WorkerFunc{},
-		conn:  conn,
-		reply: make(chan string),
 	}
+
+	// Set default deadline
+	if config.ReadDeadline == 0 {
+		config.ReadDeadline = 3 * time.Second
+	}
+	if config.WriteDeadline == 0 {
+		config.WriteDeadline = 3 * time.Second
+	}
+
+	w.protocol = NewProtocol(ProtocolConfig{
+		Conn:          conn,
+		Delegator:     w,
+		ReadDeadline:  config.ReadDeadline,
+		WriteDeadline: config.WriteDeadline,
+	})
+
+	w.protocol.SetLogger(config.Logger, config.LogLvl)
 
 	return w, nil
 }
 
-// Start listening to new schedule
-func (w *worker) Start() error {
+// Register new worker function to scheduler
+func (w *worker) Register(channel string, f WorkerFunc) {
+	w.funcs[channel] = f
 
-	if w.isRunning {
-		return nil
-	}
-	log.Println("Starting worker", w.name)
-	// Notify scheduler
-	if err := w.sendToScheduler(CommandStartConsumer); err != nil {
-		return err
-	}
-
-	w.isRunning = true
-
-	go w.listenToScheduler()
-
-	if reply := <-w.reply; reply != CommandStartConsumerReceived {
-		return errors.New("Wrong reply from scheduler: " + reply)
-	}
-
-	go w.heartbeat()
-
-	log.Println("Started worker", w.name)
-	return nil
+	// Send Register command to Scheduler
+	w.protocol.WriteCommand(command.Register(channel))
+}
+func (w *worker) Close() {
 
 }
 
-// Stop listening to new schedule
-func (w *worker) Stop() error {
+func (w *worker) close() {
 
-	log.Println("Stopping worker", w.name)
-	if !w.isRunning {
-		return nil
-	}
-
-	w.isRunning = false
-
-	// Notify scheduler
-	if err := w.sendToScheduler(CommandStopConsumer); err != nil {
-		return err
-	}
-
-	log.Println("Stopped worker", w.name)
-	return nil
+	// Close the protocol
+	w.protocol.close()
 
 }
 
-// Register new worker function
-func (w *worker) Register(name string, f WorkerFunc) {
-	w.funcs[name] = f
-}
-
-func (w *worker) heartbeat() {
-
-	ticker := time.Tick(1 * time.Second)
-
-	for {
-		// Send heartbeat check
-		if w.isRunning {
-			select {
-			case <-ticker:
-				w.sendToScheduler(CommandHeartbeat)
-			}
-
-		} else {
-			break
-		}
-	}
-}
-
-func (w *worker) sendToScheduler(message string) error {
-
-	// Timeout in 5s
-	w.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-
-	_, err := fmt.Fprintf(w.conn, w.name+" "+message+"\n")
-	return err
-}
-
-func (w *worker) listenToScheduler() {
-	log.Println("Start listening to scheduler")
-
-	// Listen to scheduler
-	for {
-		if w.isRunning {
-			receivedData, err := bufio.NewReader(w.conn).ReadString('\n')
-			if err != nil {
-				break
-			}
-			w.processCommand(w.conn, strings.Trim(receivedData, "\n"))
-		} else {
-			break
-		}
-	}
-}
-
-func (w *worker) processCommand(conn net.Conn, receivedData string) {
-
-	log.Println(receivedData)
-
-	// Connection closed
-	if receivedData == "" {
-		conn.Close()
+func (w *worker) log(lvl LogLevel, line string, args ...interface{}) {
+	if w.logger == nil {
 		return
 	}
 
-	request := strings.SplitN(receivedData, " ", 2)
-
-	// Unknown format
-	if len(request) == 0 {
+	if w.logLvl > lvl {
 		return
 	}
 
-	command := request[0]
+	w.logger.Output(2, fmt.Sprintf("%-4s %s %s", lvl, w.addr, fmt.Sprintf(line, args...)))
+}
 
-	switch command {
-
-	case CommandStartConsumerReceived:
-
-		w.reply <- CommandStartConsumerReceived
-
-	}
+func (w *worker) OnRequestReceived(index int, data []byte) {
 
 }
+
+func (w *worker) OnJobReceived(data []byte) {
+
+	strData := string(data)
+
+	job := &Job{}
+	if err := json.Unmarshal(data, job); err != nil {
+		w.log(LogLevelError, "Failed to read job %s", strData)
+		return
+	}
+
+	f, ok := w.funcs[job.Channel]
+	if !ok {
+		return
+	}
+
+	f(job)
+
+}
+
+func (w *worker) OnIOError(index int) { w.close() }

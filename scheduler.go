@@ -1,245 +1,297 @@
 package goscheduler
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/darwinsimon/goscheduler/command"
 	"github.com/robfig/cron"
 )
 
 type Scheduler interface {
-	InsertJob(name string, startAt time.Time, args map[string]string) (string, error)
-	Close() error
+	AddJob(channel string, startAt time.Time, args map[string]string) (string, error)
+	Close()
 }
 
 type scheduler struct {
-	storage         Storage
-	listener        net.Listener
-	cronObj         *cron.Cron
-	activeJobs      []*Job
-	activeConsumers map[string]*consumer
+	storage Storage
 
-	mapMutex sync.Mutex
+	logger logger
+	logLvl LogLevel
+
+	cronObj *cron.Cron
+
+	listener net.Listener
+
+	activeJobs []*Job
+	consumers  []*consumer
+
+	channelMap    map[string][]int
+	channelMapMtx sync.Mutex
+
+	jobChan chan *Job
+
+	ato int64
 }
 
 type consumer struct {
-	name          string
-	conn          net.Conn
-	channels      []string
-	lastHeartbeat time.Time
+	index    int
+	channels []string
+	protocol *Protocol
+
+	heartbeatTicker *time.Ticker
 }
 
-func NewScheduler(storage Storage, port int) (Scheduler, error) {
+// SchedulerConfig contains every configuration to create a new Scheduler
+type SchedulerConfig struct {
+	Storage Storage
 
-	c := &scheduler{
-		storage:         storage,
-		cronObj:         cron.New(),
-		mapMutex:        sync.Mutex{},
-		activeJobs:      []*Job{},
-		activeConsumers: map[string]*consumer{},
+	Port int
+
+	Logger logger
+	LogLvl LogLevel
+}
+
+// NewScheduler create new scheduler
+func NewScheduler(config SchedulerConfig) (Scheduler, error) {
+
+	s := &scheduler{
+		storage: config.Storage,
+
+		logger: config.Logger,
+		logLvl: config.LogLvl,
+
+		cronObj: cron.New(),
+
+		activeJobs: []*Job{},
+		consumers:  []*consumer{},
+
+		channelMap:    map[string][]int{},
+		channelMapMtx: sync.Mutex{},
+
+		jobChan: make(chan *Job),
 	}
 
 	var err error
 
-	// Open connection
-	c.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+	// Open listener connection
+	s.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
 	if err != nil {
 		return nil, err
 	}
 
-	c.cronObj.Start()
+	s.cronObj.Start()
 
-	go c.startAcceptingConsumers()
+	go s.startAcceptingConsumers()
+	go s.processJob()
 
-	return c, nil
+	return s, nil
 
 }
 
-// InsertJob insert new job to scheduler
-func (c *scheduler) InsertJob(name string, startAt time.Time, args map[string]string) (string, error) {
+// AddJob insert new job to scheduler
+func (s *scheduler) AddJob(channel string, startAt time.Time, args map[string]string) (string, error) {
 
 	job := &Job{
-		Name:      name,
-		ID:        generateID(10),
-		Args:      args,
-		CreatedAt: time.Now().Unix(),
-		StartAt:   startAt.Unix(),
+		Channel: channel,
+		ID:      generateID(10),
+		Args:    args,
+		StartAt: startAt.Unix(),
 	}
 
-	log.Println("Insert job", name, job.ID, "will run at", startAt.Format("5 4 15 2 1 *"))
+	s.cronObj.AddFunc(startAt.Format("5 4 15 2 1 *"), func() {
 
-	c.insertActiveJobs(job)
-
-	c.cronObj.AddFunc(startAt.Format("5 4 15 2 1 *"), func() {
-		c.processJob(name, job.ID)
+		s.jobChan <- job
 	})
 
-	return job.ID, c.storage.InsertJob(job)
+	return job.ID, s.saveToActiveJobs(job)
 
 }
 
-func (c *scheduler) SetUniqueSchedule(name string, startAt time.Time, args map[string]string) (string, error) {
+func (s *scheduler) Close() {
 
-	job := &Job{
-		Name:      name,
-		ID:        generateID(10),
-		Args:      args,
-		CreatedAt: time.Now().Unix(),
-		StartAt:   startAt.Unix(),
+	close(s.jobChan)
+
+	for i := range s.consumers {
+		s.consumers[i].heartbeatTicker.Stop()
+		s.consumers[i].protocol.close()
 	}
 
-	return job.ID, c.storage.InsertJob(job)
-
+	s.listener.Close()
 }
 
-func (c *scheduler) Close() error {
+func (s *scheduler) CloseConsumer(index int) {
 
-	return c.listener.Close()
-
-}
-
-func (c *scheduler) insertActiveJobs(job *Job) {
-
-	c.activeJobs = append(c.activeJobs, job)
-
-}
-func (c *scheduler) insertActiveConsumers(name string, conn net.Conn) error {
-
-	log.Println("New consumer", name)
-
-	newConsumer := &consumer{
-		conn:          conn,
-		channels:      []string{},
-		lastHeartbeat: time.Now(),
+	if len(s.consumers) <= index {
+		return
 	}
 
-	if _, ok := c.activeConsumers[name]; ok {
-		return errors.New("Consumer already exists")
+	s.consumers[index].protocol.close()
+
+	s.consumers = append(s.consumers[:index], s.consumers[index+1:]...)
+
+}
+
+func (c *consumer) sendHeartbeat() {
+
+	c.heartbeatTicker = time.NewTicker(1 * time.Second)
+
+	for {
+		select {
+		case <-c.heartbeatTicker.C:
+
+			c.protocol.WriteCommand(command.Heartbeat())
+		}
 	}
 
-	c.activeConsumers[name] = newConsumer
+}
 
+func (s *scheduler) saveToActiveJobs(job *Job) error {
+
+	if err := s.storage.InsertJob(job); err != nil {
+		return err
+	}
+
+	totaljobs++
+
+	s.activeJobs = append(s.activeJobs, job)
 	return nil
 
 }
 
-func (c *scheduler) removeActiveConsumers(name string, conn net.Conn) error {
+var ato int64
+var totaljobs int
 
-	log.Println("Deleting consumer", name)
+func (s *scheduler) processJob() {
 
-	if _, ok := c.activeConsumers[name]; !ok {
-		return errors.New("Consumer doesn't exists")
+	for {
+		select {
+		case job := <-s.jobChan:
+
+			atomic.AddInt64(&ato, 1)
+			// log.Println("Run scheduler for", job.Channel, job.ID)
+			s.channelMapMtx.Lock()
+			consumerIdx := s.channelMap[job.Channel]
+			//opsFinal := atomic.LoadInt64(&s.ato)
+			//
+			s.channelMapMtx.Unlock()
+
+			// Not consumer available
+			if len(consumerIdx) == 0 {
+
+			}
+
+			log.Println("Start looping consumer", job.Args["c"], ato)
+
+			// Need to implement round robin
+			/*	for i := range consumerIdx {
+
+				encoded, _ := json.Marshal(job)
+				log.Println("Encoded", totaljobs, ato)
+				if err := s.consumers[i].protocol.WriteCommand(command.Job(encoded)); err != nil {
+					s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
+				} else {
+					break
+
+
+			}}*/
+			log.Println("Finished processing: ", job.Args["c"])
+		}
 	}
 
-	delete(c.activeConsumers, name)
-
-	return nil
-
 }
 
-func (c *scheduler) processJob(name, id string) {
-
-	log.Println("Run scheduler for", name, id)
-
-}
-
-func (c *scheduler) startAcceptingConsumers() {
+func (s *scheduler) startAcceptingConsumers() {
 
 	for {
 
 		// Listen for new connection
-		conn, _ := c.listener.Accept()
-		log.Println("New connection from", conn.RemoteAddr().String())
+		conn, _ := s.listener.Accept()
+		log.Println("New worker from", conn.RemoteAddr().String())
 
-		go c.listenToConsumer(conn)
-	}
-
-}
-
-func (c *scheduler) listenToConsumer(conn net.Conn) {
-
-	for {
-
-		receivedData, err := bufio.NewReader(conn).ReadString('\n')
-		if err == nil {
-			c.processCommand(conn, strings.Trim(receivedData, "\n"))
-		} else {
-			log.Println(err)
-			break
+		// Create new consumer
+		newConsumer := &consumer{
+			index: len(s.consumers),
+			protocol: NewProtocol(ProtocolConfig{
+				Conn:          conn,
+				Index:         len(s.consumers),
+				Delegator:     s,
+				ReadDeadline:  5 * time.Second,
+				WriteDeadline: 5 * time.Second,
+			}),
 		}
 
-	}
+		// Set logger
+		newConsumer.protocol.SetLogger(s.logger, s.logLvl)
 
-	// Connection close
-	log.Println("Lost connection to", conn.RemoteAddr())
+		// go newConsumer.sendHeartbeat()
 
-}
+		s.consumers = append(s.consumers, newConsumer)
 
-func (c *scheduler) refreshHeartbeat(consumerName string) {
-
-	c.mapMutex.Lock()
-	defer c.mapMutex.Unlock()
-
-	if c.activeConsumers[consumerName] != nil {
-		c.activeConsumers[consumerName].lastHeartbeat = time.Now()
 	}
 
 }
 
-func (c *scheduler) processCommand(conn net.Conn, receivedData string) {
+// add new channel to map
+func (s *scheduler) registerNewChannel(index int, channel string) {
 
-	log.Println(receivedData)
+	log.Println("Start registering new channel", channel)
+	s.channelMapMtx.Lock()
+	defer s.channelMapMtx.Unlock()
 
-	// Connection closed
-	if receivedData == "" {
-		conn.Close()
+	if _, ok := s.channelMap[channel]; !ok {
+		s.channelMap[channel] = []int{}
+	}
+
+	// Check for duplicate index
+	for ch := range s.channelMap[channel] {
+		if s.channelMap[channel][ch] == index {
+			return
+		}
+	}
+
+	s.channelMap[channel] = append(s.channelMap[channel], index)
+	log.Println("Registered new channel", channel)
+
+}
+
+func (s *scheduler) log(lvl LogLevel, line string, args ...interface{}) {
+	if s.logger == nil {
 		return
 	}
 
-	request := strings.SplitN(receivedData, " ", 3)
-
-	// Unknown format
-	if len(request) < 2 {
+	if s.logLvl > lvl {
 		return
 	}
 
-	consumerName := request[0]
-	command := request[1]
+	s.logger.Output(2, fmt.Sprintf("%-4s %s", lvl, fmt.Sprintf(line, args...)))
+}
 
-	switch command {
-	case CommandHeartbeat:
-		if err := c.sendToConsumer(consumerName, conn, time.Now().String()); err == nil {
+func (s *scheduler) OnRequestReceived(index int, data []byte) {
 
-		}
-
-		c.refreshHeartbeat(consumerName)
-
-	case CommandStartConsumer:
-
-		if err := c.insertActiveConsumers(consumerName, conn); err == nil {
-			c.sendToConsumer(consumerName, conn, CommandStartConsumerReceived)
-		}
-
-	case CommandStopConsumer:
-
-		c.removeActiveConsumers(consumerName, conn)
+	strData := string(data)
+	commands := strings.Split(strData, " ")
+	if len(commands) == 0 {
+		return
 	}
+	switch commands[0] {
+	case command.CRegister:
 
+		if len(commands) != 2 {
+			s.log(LogLevelWarning, "Wrong REG command %s", strData)
+			return
+		}
+
+		s.registerNewChannel(index, commands[1])
+
+	default:
+		s.log(LogLevelWarning, "Unknown command %s", strData)
+	}
 }
-
-func (c *scheduler) sendToConsumer(name string, conn net.Conn, message string) error {
-	log.Println("Send to consumer", name, message)
-
-	// Timeout in 5s
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-
-	_, err := conn.Write([]byte(message + "\n"))
-	log.Println(err)
-	return err
-}
+func (s *scheduler) OnJobReceived(data []byte) {}
+func (s *scheduler) OnIOError(index int)       { s.CloseConsumer(index) }

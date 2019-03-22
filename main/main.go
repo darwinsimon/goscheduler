@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/darwinsimon/goscheduler"
@@ -9,45 +11,65 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Llongfile)
 
-	st := storage.NewCassandra()
+	// Create storage
+	st := storage.NewLocal()
 
-	sc, err := goscheduler.NewScheduler(st, 7000)
+	// Scheduler config
+	config := goscheduler.SchedulerConfig{
+		Storage: st,
+
+		Port: 7000,
+
+		Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+		LogLvl: goscheduler.LogLevelDebug,
+	}
+
+	// Create scheduler instance
+	sc, err := goscheduler.NewScheduler(config)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer sc.Close()
 
-	//sc.InsertJob("test", time.Now().Add(2*time.Second), map[string]string{
-	//	"c": "d",
-	//})
+	// Insert new job
+	for i := 1; i < 1000; i++ {
 
-	//sc.InsertJob("test2", time.Now().Add(5*time.Second), map[string]string{
-	//	"a": "b",
-	//})
-
-	for x := 1; x < 2; x++ {
-		worker, err := goscheduler.NewWorker("localhost:7000")
-		log.Println(worker, err)
-		worker.Register("test", haha)
-		log.Println(worker.Start())
-
-		go func() {
-			time.Sleep(3 * time.Second)
-			log.Println(worker.Stop())
-			time.Sleep(3 * time.Second)
-			log.Println(worker.Start())
-		}()
+		// time.Now().Add(time.Duration(1*300))*time.Millisecond)
+		sc.AddJob("do_something", time.Now().Add(1*time.Second), map[string]string{
+			"c": fmt.Sprintf("%d", i),
+		})
 	}
+
+	sc.AddJob("dead_channel", time.Now().Add(1*time.Second), map[string]string{
+		"a": "b",
+	})
+
+	// Create workers
+	workerConfig := goscheduler.WorkerConfig{
+		Storage: st,
+
+		Address: "localhost:7000",
+
+		Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+		LogLvl: goscheduler.LogLevelDebug,
+	}
+
+	worker, err := goscheduler.NewWorker(workerConfig)
+	if err != nil {
+		log.Println(err)
+	}
+	worker.Register("do_something", doSomething)
+	defer worker.Close()
 
 	for {
 	}
 
 }
 
-func haha(schedule *goscheduler.Job) error {
-	log.Println("berjalan")
+func doSomething(job *goscheduler.Job) error {
+
+	log.Println("Running job", job.Channel, job.ID, job.Args)
 
 	return nil
 }
