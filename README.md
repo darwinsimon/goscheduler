@@ -6,12 +6,69 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 ## Scheduler
 ```golang
 
-schedulerConfig := goscheduler.SchedulerConfig{
-}
+	// Set your logger
+	myLogger := log.New(os.Stderr, "", log.LstdFlags|log.Llongfile)
 
-sc, err := goscheduler.NewScheduler(schedulerConfig)
-if err != nil {
-	log.Fatal("Failed to initialize scheduler")
-}
+	// Scheduler config
+	config := goscheduler.SchedulerConfig{
+
+		Storage: myStorage, // use your own storage
+
+		Port: 7000,
+
+		Logger: myLogger,
+		LogLvl: goscheduler.LogLevelDebug,
+	}
+
+	// Create scheduler instance
+	sc, err := goscheduler.NewScheduler(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sc.Close()
+
+
+	// Adding new job
+	// will run in 5 seconds
+	sc.AddJob("channel_name", time.Now().Add(5*time.Second), map[string]string{
+		"name": "foo",
+		"age": 28,
+	})
+
 ```
 ## Worker
+```golang
+
+	// Set your logger
+	myLogger := log.New(os.Stderr, "", log.LstdFlags|log.Llongfile)
+
+	// Worker config
+	workerConfig := goscheduler.WorkerConfig{
+		
+		Storage: myStorage, // use your own storage
+
+		Address: "localhost:7000",
+
+		Logger: myLogger,
+		LogLvl: goscheduler.LogLevelDebug,
+	}
+
+	// Create worker instance
+	worker, err := goscheduler.NewWorker(workerConfig)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer worker.Close()
+
+	// Register for new channel listener
+	worker.Register("channel_name", callback)
+
+
+	// Create callback function
+	func callback(job *goscheduler.Job) error {
+		log.Println("Running job", job.Channel, job.ID, job.Args)
+		return nil
+	}
+
+
+```
