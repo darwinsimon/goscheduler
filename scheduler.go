@@ -77,6 +77,10 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		jobChan: make(chan *Job),
 	}
 
+	if s.storage != nil {
+		s.initializeActiveJobs()
+	}
+
 	var err error
 
 	// Open listener connection
@@ -101,13 +105,10 @@ func (s *scheduler) AddJob(channel string, startAt time.Time, args map[string]st
 		Channel: channel,
 		ID:      generateID(10),
 		Args:    args,
-		StartAt: startAt.Unix(),
+		StartAt: startAt,
 	}
 
-	s.cronObj.AddFunc(startAt.Format("5 4 15 2 1 *"), func() {
-
-		s.jobChan <- job
-	})
+	s.addJobToCron(job)
 
 	return job.ID, s.saveToActiveJobs(job)
 
@@ -125,7 +126,22 @@ func (s *scheduler) Close() {
 	s.listener.Close()
 }
 
-func (s *scheduler) CloseConsumer(index int) {
+func (s *scheduler) initializeActiveJobs() {
+
+	s.activeJobs = s.storage.GetActiveJobs()
+	for j := range s.activeJobs {
+		s.addJobToCron(s.activeJobs[j])
+	}
+
+}
+
+func (s *scheduler) addJobToCron(job *Job) {
+	s.cronObj.AddFunc(job.StartAt.Format("5 4 15 2 1 *"), func() {
+		s.jobChan <- job
+	})
+}
+
+func (s *scheduler) closeConsumer(index int) {
 
 	if len(s.consumers) <= index {
 		return
@@ -153,8 +169,11 @@ func (c *consumer) sendHeartbeat() {
 
 func (s *scheduler) saveToActiveJobs(job *Job) error {
 
-	if err := s.storage.InsertJob(job); err != nil {
-		return err
+	// Insert to storage if available
+	if s.storage != nil {
+		if err := s.storage.InsertJob(job); err != nil {
+			return err
+		}
 	}
 
 	totaljobs++
@@ -294,4 +313,4 @@ func (s *scheduler) OnRequestReceived(index int, data []byte) {
 	}
 }
 func (s *scheduler) OnJobReceived(data []byte) {}
-func (s *scheduler) OnIOError(index int)       { s.CloseConsumer(index) }
+func (s *scheduler) OnIOError(index int)       { s.closeConsumer(index) }

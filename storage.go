@@ -1,8 +1,9 @@
 package goscheduler
 
+// Storage provides initial data for scheduler during initialization
 type Storage interface {
-	GetAll() (jobs []*Job)
+	GetActiveJobs() (jobs []*Job)
 	GetJob(id string) error
 	InsertJob(job *Job) error
-	RemoveJOb(id string) error
+	SetJobAsFinished(id string) error
 }
