@@ -3,6 +3,7 @@ package goscheduler
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -11,13 +12,12 @@ import (
 
 // A Worker interface provides all functions for job consumer
 type Worker interface {
-	Register(channel string, f WorkerFunc)
+	Register(channel string, f WorkerFunc) error
 	Close()
 }
 
 type worker struct {
 	addr     string
-	storage  Storage
 	protocol *Protocol
 
 	logger logger
@@ -28,8 +28,6 @@ type worker struct {
 
 // WorkerConfig contains every configuration to create a new Worker
 type WorkerConfig struct {
-	Storage Storage
-
 	Address string
 
 	Logger logger
@@ -53,8 +51,6 @@ func NewWorker(config WorkerConfig) (Worker, error) {
 	w := &worker{
 		addr: conn.LocalAddr().String(),
 
-		storage: config.Storage,
-
 		logger: config.Logger,
 		logLvl: config.LogLvl,
 
@@ -69,7 +65,7 @@ func NewWorker(config WorkerConfig) (Worker, error) {
 		config.WriteDeadline = 3 * time.Second
 	}
 
-	w.protocol = NewProtocol(ProtocolConfig{
+	w.protocol = newProtocol(ProtocolConfig{
 		Conn:          conn,
 		Delegator:     w,
 		ReadDeadline:  config.ReadDeadline,
@@ -82,11 +78,12 @@ func NewWorker(config WorkerConfig) (Worker, error) {
 }
 
 // Register new worker function to scheduler
-func (w *worker) Register(channel string, f WorkerFunc) {
+func (w *worker) Register(channel string, f WorkerFunc) error {
 	w.funcs[channel] = f
 
 	// Send Register command to Scheduler
-	w.protocol.WriteCommand(command.Register(channel))
+	return w.protocol.WriteCommand(command.Register(channel))
+
 }
 func (w *worker) Close() {
 
@@ -95,7 +92,7 @@ func (w *worker) Close() {
 func (w *worker) close() {
 
 	// Close the protocol
-	w.protocol.close()
+	w.protocol.Close()
 
 }
 
@@ -111,8 +108,9 @@ func (w *worker) log(lvl LogLevel, line string, args ...interface{}) {
 	w.logger.Output(2, fmt.Sprintf("%-4s %s %s", lvl, w.addr, fmt.Sprintf(line, args...)))
 }
 
+func (w *worker) OnConnClose() {}
 func (w *worker) OnRequestReceived(index int, data []byte) {
-
+	log.Println(string(data))
 }
 
 func (w *worker) OnJobReceived(data []byte) {

@@ -11,7 +11,6 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 
 	// Scheduler config
 	config := goscheduler.SchedulerConfig{
-
 		Storage: myStorage, // use your own storage
 
 		Port: 7000,
@@ -30,7 +29,7 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 
 	// Adding new job
 	// will run in 5 seconds
-	sc.AddJob("channel_name", time.Now().Add(5*time.Second), map[string]string{
+	sc.AddJob("channel_name", time.Now().Add(5*time.Second), map[string]interface{}{
 		"name": "foo",
 		"age": 28,
 	})
@@ -44,9 +43,6 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 
 	// Worker config
 	workerConfig := goscheduler.WorkerConfig{
-		
-		Storage: myStorage, // use your own storage
-
 		Address: "localhost:7000",
 
 		Logger: myLogger,

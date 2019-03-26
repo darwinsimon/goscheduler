@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -47,7 +46,8 @@ type ProtocolConfig struct {
 	WriteDeadline time.Duration
 }
 
-func NewProtocol(config ProtocolConfig) *Protocol {
+func newProtocol(config ProtocolConfig) *Protocol {
+
 	p := &Protocol{
 		addr: config.Conn.LocalAddr().String(),
 
@@ -108,7 +108,6 @@ func (p *Protocol) SetLogger(l logger, lvl LogLevel) {
 // to this connection, and flush.
 func (p *Protocol) WriteCommand(cmd *command.Command) error {
 	p.mtx.Lock()
-
 	_, err := cmd.WriteTo(p)
 	if err != nil {
 		goto writeCommandExit
@@ -119,11 +118,11 @@ writeCommandExit:
 
 	p.mtx.Unlock()
 
-	log.Println("write command for", string(cmd.Name), string(cmd.Body))
 	if err != nil {
 		p.log(LogLevelError, "%s", err)
 		p.delegator.OnIOError(p.index)
 	}
+
 	return err
 }
 
@@ -161,12 +160,13 @@ func (p *Protocol) readLoop() {
 
 exit:
 
-	p.close()
+	p.Close()
 }
 
-func (p *Protocol) close() {
+// Close TCP connection and trigger delegator to prepare for closing
+func (p *Protocol) Close() {
 
-	close(p.exitChan)
+	p.delegator.OnConnClose()
 	p.c.Close()
 
 }
@@ -203,7 +203,6 @@ func readResponse(r io.Reader) (byte, []byte, error) {
 	buf := make([]byte, msgSize)
 	_, err = io.ReadFull(r, buf)
 	if err != nil {
-		log.Println(err)
 		return 0, nil, err
 	}
 

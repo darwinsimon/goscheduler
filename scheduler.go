@@ -1,20 +1,20 @@
 package goscheduler
 
 import (
+	"errors"
 	"fmt"
-	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/darwinsimon/goscheduler/command"
-	"github.com/robfig/cron"
 )
 
 type Scheduler interface {
-	AddJob(channel string, startAt time.Time, args map[string]string) (string, error)
+	AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error)
 	Close()
 }
 
@@ -24,19 +24,22 @@ type scheduler struct {
 	logger logger
 	logLvl LogLevel
 
-	cronObj *cron.Cron
-
 	listener net.Listener
 
-	activeJobs []*Job
-	consumers  []*consumer
+	// activeJobs []*Job
+	consumers []*consumer
 
 	channelMap    map[string][]int
 	channelMapMtx sync.Mutex
 
-	jobChan chan *Job
+	batchKeys   []string
+	batchMap    map[string]*JobBatch
+	batchMapMtx sync.Mutex
 
-	ato int64
+	newJobChan chan time.Time
+
+	closeMtx  sync.Mutex
+	closeChan chan bool
 }
 
 type consumer struct {
@@ -66,15 +69,20 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		logger: config.Logger,
 		logLvl: config.LogLvl,
 
-		cronObj: cron.New(),
-
-		activeJobs: []*Job{},
-		consumers:  []*consumer{},
+		// activeJobs: []*Job{},
+		consumers: []*consumer{},
 
 		channelMap:    map[string][]int{},
 		channelMapMtx: sync.Mutex{},
 
-		jobChan: make(chan *Job),
+		batchKeys:   []string{},
+		batchMap:    map[string]*JobBatch{},
+		batchMapMtx: sync.Mutex{},
+
+		newJobChan: make(chan time.Time, 1),
+
+		closeMtx:  sync.Mutex{},
+		closeChan: make(chan bool, 1),
 	}
 
 	if s.storage != nil {
@@ -89,38 +97,52 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		return nil, err
 	}
 
-	s.cronObj.Start()
-
+	go s.runTimer()
 	go s.startAcceptingConsumers()
-	go s.processJob()
 
 	return s, nil
 
 }
 
 // AddJob insert new job to scheduler
-func (s *scheduler) AddJob(channel string, startAt time.Time, args map[string]string) (string, error) {
+func (s *scheduler) AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error) {
+
+	// Remove milliseconds
+	runAt = runAt.Truncate(1 * time.Second)
+
+	now := time.Now()
+
+	if now.Sub(runAt).Seconds() > 0 {
+		return "", errors.New(ErrorJobHasExpired)
+	}
 
 	job := &Job{
 		Channel: channel,
 		ID:      generateID(10),
 		Args:    args,
-		StartAt: startAt,
+		RunAt:   runAt,
 	}
 
-	s.addJobToCron(job)
+	// Insert to storage if available
+	if s.storage != nil {
+		if err := s.storage.InsertJob(job); err != nil {
+			return "", err
+		}
+	}
 
-	return job.ID, s.saveToActiveJobs(job)
+	if isNewKey := s.insertToBatch(job); isNewKey {
+		s.newJobChan <- runAt
+	}
+
+	return job.ID, nil
 
 }
 
 func (s *scheduler) Close() {
 
-	close(s.jobChan)
-
 	for i := range s.consumers {
 		s.consumers[i].heartbeatTicker.Stop()
-		s.consumers[i].protocol.close()
+		s.consumers[i].protocol.Close()
 	}
 
 	s.listener.Close()
@@ -128,17 +150,92 @@ func (s *scheduler) Close() {
 
 func (s *scheduler) initializeActiveJobs() {
 
-	s.activeJobs = s.storage.GetActiveJobs()
-	for j := range s.activeJobs {
-		s.addJobToCron(s.activeJobs[j])
+	activeJobs := s.storage.GetActiveJobs()
+	for j := range activeJobs {
+		s.insertToBatch(activeJobs[j])
 	}
 
 }
 
-func (s *scheduler) addJobToCron(job *Job) {
-	s.cronObj.AddFunc(job.StartAt.Format("5 4 15 2 1 *"), func() {
-		s.jobChan <- job
-	})
+func (s *scheduler) runTimer() {
+
+	for {
+
+		var timer = time.NewTimer(100 * time.Hour)
+
+		now := time.Now()
+		nearestKey := now.Format("20060102150405")
+
+		sort.Strings(s.batchKeys)
+
+		if len(s.batchKeys) > 0 {
+
+			// Get nearest and not expired schedule
+			for _, bk := range s.batchKeys {
+
+				if nearestKey < bk {
+
+					s.batchMapMtx.Lock()
+					job, ok := s.batchMap[bk]
+					s.batchMapMtx.Unlock()
+
+					if ok {
+
+						timer.Stop()
+						timer = time.NewTimer(job.RunAt.Sub(now))
+
+						break
+					}
+
+				} else if nearestKey >= bk {
+					break
+				}
+
+			}
+
+		}
+
+		select {
+		case runTime := <-timer.C:
+
+			currentKey := runTime.Format("20060102150405")
+
+			s.batchMapMtx.Lock()
+			batch, ok := s.batchMap[currentKey]
+			delete(s.batchMap, currentKey)
+			s.batchMapMtx.Unlock()
+
+			if ok {
+
+				go func() {
+
+					// Remove batch key from array
+					for k := range s.batchKeys {
+						if currentKey == s.batchKeys[k] {
+							s.batchKeys = append(s.batchKeys[:k], s.batchKeys[k+1:]...)
+							break
+						}
+					}
+
+				}()
+
+				go func(jobs []*Job) {
+
+					for j := range jobs {
+						go s.processJob(jobs[j])
+					}
+
+				}(batch.Jobs)
+			}
+
+		case <-s.newJobChan:
+
+			timer.Stop()
+
+		}
+
+	}
+
 }
 
 func (s *scheduler) closeConsumer(index int) {
@@ -147,7 +244,7 @@ func (s *scheduler) closeConsumer(index int) {
 		return
 	}
 
-	s.consumers[index].protocol.close()
+	s.consumers[index].protocol.Close()
 
 	s.consumers = append(s.consumers[:index], s.consumers[index+1:]...)
 
@@ -157,11 +254,9 @@ func (c *consumer) sendHeartbeat() {
 
 	c.heartbeatTicker = time.NewTicker(1 * time.Second)
 
-	for {
-		select {
-		case <-c.heartbeatTicker.C:
-
-			c.protocol.WriteCommand(command.Heartbeat())
+	for range c.heartbeatTicker.C {
+		if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
+			c.heartbeatTicker.Stop()
 		}
 	}
 
@@ -176,51 +271,64 @@ func (s *scheduler) saveToActiveJobs(job *Job) error {
 		}
 	}
 
-	totaljobs++
+	s.insertToBatch(job)
 
-	s.activeJobs = append(s.activeJobs, job)
 	return nil
 
 }
 
-var ato int64
-var totaljobs int
+func (s *scheduler) insertToBatch(job *Job) bool {
 
-func (s *scheduler) processJob() {
+	var isNewKey bool
 
-	for {
-		select {
-		case job := <-s.jobChan:
+	batchKey := job.RunAt.Format("20060102150405")
 
-			atomic.AddInt64(&ato, 1)
-			// log.Println("Run scheduler for", job.Channel, job.ID)
-			s.channelMapMtx.Lock()
-			consumerIdx := s.channelMap[job.Channel]
-			//opsFinal := atomic.LoadInt64(&s.ato)
-			//
-			s.channelMapMtx.Unlock()
+	s.batchMapMtx.Lock()
+	defer s.batchMapMtx.Unlock()
 
-			// Not consumer available
-			if len(consumerIdx) == 0 {
-
-			}
-
-			log.Println("Start looping consumer", job.Args["c"], ato)
-
-			// Need to implement round robin
-			/*	for i := range consumerIdx {
-
-				encoded, _ := json.Marshal(job)
-				log.Println("Encoded", totaljobs, ato)
-				if err := s.consumers[i].protocol.WriteCommand(command.Job(encoded)); err != nil {
-					s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
-				} else {
-					break
-
-
-			}}*/
-			log.Println("Finished processing: ", job.Args["c"])
+	// Initialize new batch
+	if _, ok := s.batchMap[batchKey]; !ok {
+		s.batchMap[batchKey] = &JobBatch{
+			RunAt: job.RunAt,
+			Jobs:  []*Job{},
 		}
+		s.batchKeys = append(s.batchKeys, batchKey)
+		isNewKey = true
+	}
+
+	s.batchMap[batchKey].Jobs = append(s.batchMap[batchKey].Jobs, job)
+
+	return isNewKey
+
+}
+
+var ato int64
+
+func (s *scheduler) processJob(job *Job) {
+
+	atomic.AddInt64(&ato, 1)
+
+	s.channelMapMtx.Lock()
+	consumerIdx := s.channelMap[job.Channel]
+	s.channelMapMtx.Unlock()
+
+	// No consumer available
+	if len(consumerIdx) == 0 {
+
+	}
+
+	// Need to implement round robin
+	for ii := range consumerIdx {
+
+		//encoded, _ := json.Marshal(job)
+
+		if err := s.consumers[ii].protocol.WriteCommand(command.Job([]byte(`{"channel":"dead_channel","id":"463778310c0913d50819","args":{"a":"b"},"run_at":"2019-03-26T14:27:21+07:00"}`))); err != nil {
+
+			s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
+		} else {
+			break
+		}
+		break
 	}
 
 }
@@ -230,13 +338,18 @@ func (s *scheduler) startAcceptingConsumers() {
 	for {
 
 		// Listen for new connection
-		conn, _ := s.listener.Accept()
-		log.Println("New worker from", conn.RemoteAddr().String())
+		conn, err := s.listener.Accept()
+		if err != nil {
+			s.log(LogLevelError, "Failed listen to new worker: %v", err)
+			break
+		}
+
+		s.log(LogLevelInfo, "New worker at %s", conn.RemoteAddr().String())
 
 		// Create new consumer
 		newConsumer := &consumer{
 			index: len(s.consumers),
-			protocol: NewProtocol(ProtocolConfig{
+			protocol: newProtocol(ProtocolConfig{
 				Conn:          conn,
 				Index:         len(s.consumers),
 				Delegator:     s,
@@ -248,7 +361,7 @@ func (s *scheduler) startAcceptingConsumers() {
 		// Set logger
 		newConsumer.protocol.SetLogger(s.logger, s.logLvl)
 
-		// go newConsumer.sendHeartbeat()
+		go newConsumer.sendHeartbeat()
 
 		s.consumers = append(s.consumers, newConsumer)
 
@@ -259,7 +372,6 @@ func (s *scheduler) startAcceptingConsumers() {
 // add new channel to map
 func (s *scheduler) registerNewChannel(index int, channel string) {
 
-	log.Println("Start registering new channel", channel)
 	s.channelMapMtx.Lock()
 	defer s.channelMapMtx.Unlock()
 
@@ -275,7 +387,7 @@ func (s *scheduler) registerNewChannel(index int, channel string) {
 	}
 
 	s.channelMap[channel] = append(s.channelMap[channel], index)
-	log.Println("Registered new channel", channel)
+	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.consumers[index].protocol.addr)
 
 }
 
@@ -289,6 +401,10 @@ func (s *scheduler) log(lvl LogLevel, line string, args ...interface{}) {
 	}
 
 	s.logger.Output(2, fmt.Sprintf("%-4s %s", lvl, fmt.Sprintf(line, args...)))
+}
+
+func (s *scheduler) OnConnClose() {
+	s.closeChan <- true
 }
 
 func (s *scheduler) OnRequestReceived(index int, data []byte) {

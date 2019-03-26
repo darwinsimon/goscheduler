@@ -3,7 +3,6 @@ package command
 import (
 	"encoding/binary"
 	"io"
-	"log"
 )
 
 var byteSpace = []byte(" ")
@@ -91,7 +90,6 @@ func (c *Command) WriteTo(w io.Writer) (int, error) {
 		}
 	}
 
-	log.Println("Finished writing:", string(c.Name), string(c.Body))
 	return total, nil
 
 }
