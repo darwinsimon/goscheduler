@@ -11,9 +11,7 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 
 	// Scheduler config
 	config := goscheduler.SchedulerConfig{
-		Storage: myStorage, // use your own storage
-
-		Port: 7000,
+		Address: ":7000",
 
 		Logger: myLogger,
 		LogLvl: goscheduler.LogLevelDebug,
@@ -24,7 +22,7 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer sc.Close()
+	defer sc.Stop()
 
 
 	// Adding new job
@@ -54,7 +52,7 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer worker.Close()
+	defer worker.Stop()
 
 	// Register for new channel listener
 	worker.Register("channel_name", callback)

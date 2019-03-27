@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/darwinsimon/goscheduler"
-	"github.com/darwinsimon/goscheduler/storage"
 )
 
 func main() {
@@ -22,14 +21,10 @@ func main() {
 
 	if !workerOnly {
 
-		// Create storage
-		st := storage.NewLocal()
-
 		// Scheduler config
 		config := goscheduler.SchedulerConfig{
-			Storage: st,
 
-			Port: 7000,
+			Address: ":7000",
 
 			Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
 			LogLvl: goscheduler.LogLevelDebug,
@@ -40,7 +35,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer sc.Close()
+		defer sc.Stop()
 
 		sc.AddJob("dead_channel", time.Now().Add(1*time.Second), map[string]interface{}{
 			"a": "b",
@@ -57,29 +52,6 @@ func main() {
 			})
 
 		}
-		/*
-			// Insert new job
-			for i := 1; i == 14000; i++ {
-
-				// t, _ := time.Parse("20060102150405 MST", "20190326095701 WIB")
-				// time.Now().Add((3*time.Second)+time.Duration(i%10)*time.Second)
-				sc.AddJob("do_something", time.Now().Add((2*time.Second)+time.Duration(i%3)*time.Second), map[string]string{
-					"c": fmt.Sprintf("%d", i),
-				})
-
-			}
-		*/
-
-		log.Println("Finished")
-		/*
-			go func() {
-				time.Sleep(5 * time.Second)
-
-				sc.AddJob("do_something", time.Now().Add(1*time.Second), map[string]string{
-					"c": fmt.Sprintf("%d", 20000),
-				})
-			}()
-		*/
 	} else {
 
 		// Create workers
@@ -95,18 +67,9 @@ func main() {
 			log.Println(err)
 		}
 		log.Println(worker.Register("do_something", doSomething))
-		defer worker.Close()
+		defer worker.Stop()
 
 	}
-
-	/*// Insert new job
-	for i := 1; i <= 2000; i++ {
-
-		// time.Now().Add(time.Duration(1*300))*time.Millisecond)
-		sc.AddJob("do_something", time.Now().Add(4*time.Second), map[string]string{
-			"c": fmt.Sprintf("%d", i*10),
-		})
-	}*/
 
 	exitChan = make(chan int, 1)
 

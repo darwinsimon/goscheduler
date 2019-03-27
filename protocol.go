@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/darwinsimon/goscheduler/command"
@@ -30,12 +31,12 @@ type Protocol struct {
 	readDeadline  time.Duration
 	writeDeadline time.Duration
 
-	mtx    sync.Mutex
-	logger logger
-	logLvl LogLevel
+	writeMtx sync.Mutex
+	logger   logger
+	logLvl   LogLevel
 
-	cmdChan  chan *command.Command
-	exitChan chan int
+	closeFlag int32
+	wg        sync.WaitGroup
 }
 
 type ProtocolConfig struct {
@@ -58,19 +59,16 @@ func newProtocol(config ProtocolConfig) *Protocol {
 
 		delegator: config.Delegator,
 
-		cmdChan:  make(chan *command.Command),
-		exitChan: make(chan int),
-
 		readDeadline:  config.ReadDeadline,
 		writeDeadline: config.WriteDeadline,
 	}
 
 	// Set default deadline
 	if p.readDeadline.Nanoseconds() == 0 {
-		p.readDeadline = 5 * time.Second
+		p.readDeadline = 3 * time.Second
 	}
 	if p.writeDeadline.Nanoseconds() == 0 {
-		p.writeDeadline = 5 * time.Second
+		p.writeDeadline = 3 * time.Second
 	}
 
 	go p.readLoop()
@@ -107,7 +105,12 @@ func (p *Protocol) SetLogger(l logger, lvl LogLevel) {
 // WriteCommand is a goroutine safe method to write a Command
 // to this connection, and flush.
 func (p *Protocol) WriteCommand(cmd *command.Command) error {
-	p.mtx.Lock()
+
+	if atomic.LoadInt32(&p.closeFlag) == 1 {
+		return errors.New(ErrorClosedConnection)
+	}
+
+	p.writeMtx.Lock()
 	_, err := cmd.WriteTo(p)
 	if err != nil {
 		goto writeCommandExit
@@ -116,7 +119,7 @@ func (p *Protocol) WriteCommand(cmd *command.Command) error {
 
 writeCommandExit:
 
-	p.mtx.Unlock()
+	p.writeMtx.Unlock()
 
 	if err != nil {
 		p.log(LogLevelError, "%s", err)
@@ -128,23 +131,32 @@ writeCommandExit:
 
 func (p *Protocol) readLoop() {
 
+	p.wg.Add(1)
+
 	for {
-		streamType, data, err := readResponse(p.r)
-		if err != nil {
-			p.log(LogLevelError, "%v", err)
-			p.delegator.OnIOError(p.index)
 
-			goto exit
-
+		if atomic.LoadInt32(&p.closeFlag) == 1 {
+			goto readLoopExit
 		}
 
-		// p.log(LogLevelDebug, "Received message %s", string(data))
+		// Wait for any message
+		streamType, data, err := readResponse(p.r)
+		if err != nil {
+			p.log(LogLevelError, "Failed to read %v", err)
+			p.delegator.OnIOError(p.index)
+
+			goto readLoopExit
+		}
+
+		go p.log(LogLevelDebug, "Received message %s", string(data))
 
 		switch streamType {
 		case command.StreamTypeHeartbeat:
-			continue
+			break
 		case command.StreamTypeRequest:
+
 			p.delegator.OnRequestReceived(p.index, data)
+
 		case command.StreamTypeResponse:
 
 			// c.delegate.OnMessage(c, "msg")
@@ -155,19 +167,31 @@ func (p *Protocol) readLoop() {
 
 		default:
 
+			p.log(LogLevelError, "Unknown message", string(data))
+
 		}
 	}
 
-exit:
+readLoopExit:
 
+	p.wg.Done()
 	p.Close()
 }
 
 // Close TCP connection and trigger delegator to prepare for closing
 func (p *Protocol) Close() {
 
-	p.delegator.OnConnClose()
+	if !atomic.CompareAndSwapInt32(&p.closeFlag, 0, 1) {
+		return
+	}
+
+	p.log(LogLevelInfo, "Closing connection...")
+
+	go p.delegator.OnConnClose()
+
 	p.c.Close()
+
+	p.wg.Wait()
 
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/darwinsimon/goscheduler/command"
@@ -13,7 +14,7 @@ import (
 // A Worker interface provides all functions for job consumer
 type Worker interface {
 	Register(channel string, f WorkerFunc) error
-	Close()
+	Stop()
 }
 
 type worker struct {
@@ -22,6 +23,8 @@ type worker struct {
 
 	logger logger
 	logLvl LogLevel
+
+	closeFlag int32
 
 	funcs map[string]WorkerFunc
 }
@@ -85,15 +88,14 @@ func (w *worker) Register(channel string, f WorkerFunc) error {
 	return w.protocol.WriteCommand(command.Register(channel))
 
 }
-func (w *worker) Close() {
 
-}
+// Stop worker and close the connection
+func (w *worker) Stop() {
+	if !atomic.CompareAndSwapInt32(&w.closeFlag, 0, 1) {
+		return
+	}
 
-func (w *worker) close() {
-
-	// Close the protocol
 	w.protocol.Close()
-
 }
 
 func (w *worker) log(lvl LogLevel, line string, args ...interface{}) {
@@ -108,7 +110,10 @@ func (w *worker) log(lvl LogLevel, line string, args ...interface{}) {
 	w.logger.Output(2, fmt.Sprintf("%-4s %s %s", lvl, w.addr, fmt.Sprintf(line, args...)))
 }
 
-func (w *worker) OnConnClose() {}
+func (w *worker) OnConnClose() {
+	w.Stop()
+}
+
 func (w *worker) OnRequestReceived(index int, data []byte) {
 	log.Println(string(data))
 }
@@ -132,4 +137,4 @@ func (w *worker) OnJobReceived(data []byte) {
 
 }
 
-func (w *worker) OnIOError(index int) { w.close() }
+func (w *worker) OnIOError(index int) {}

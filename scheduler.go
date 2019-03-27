@@ -1,6 +1,7 @@
 package goscheduler
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,7 +16,7 @@ import (
 
 type Scheduler interface {
 	AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error)
-	Close()
+	Stop()
 }
 
 type scheduler struct {
@@ -26,8 +27,7 @@ type scheduler struct {
 
 	listener net.Listener
 
-	// activeJobs []*Job
-	consumers []*consumer
+	workers []*workerConn
 
 	channelMap    map[string][]int
 	channelMapMtx sync.Mutex
@@ -36,13 +36,13 @@ type scheduler struct {
 	batchMap    map[string]*JobBatch
 	batchMapMtx sync.Mutex
 
-	newJobChan chan time.Time
+	newJobChan chan bool
 
 	closeMtx  sync.Mutex
 	closeChan chan bool
 }
 
-type consumer struct {
+type workerConn struct {
 	index    int
 	channels []string
 	protocol *Protocol
@@ -54,7 +54,7 @@ type consumer struct {
 type SchedulerConfig struct {
 	Storage Storage
 
-	Port int
+	Address string
 
 	Logger logger
 	LogLvl LogLevel
@@ -69,8 +69,7 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		logger: config.Logger,
 		logLvl: config.LogLvl,
 
-		// activeJobs: []*Job{},
-		consumers: []*consumer{},
+		workers: []*workerConn{},
 
 		channelMap:    map[string][]int{},
 		channelMapMtx: sync.Mutex{},
@@ -79,26 +78,30 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		batchMap:    map[string]*JobBatch{},
 		batchMapMtx: sync.Mutex{},
 
-		newJobChan: make(chan time.Time, 1),
+		newJobChan: make(chan bool),
 
 		closeMtx:  sync.Mutex{},
-		closeChan: make(chan bool, 1),
+		closeChan: make(chan bool),
 	}
 
+	// Get jobs from storage if available
 	if s.storage != nil {
-		s.initializeActiveJobs()
+		if err := s.initializeActiveJobs(); err != nil {
+			return nil, err
+		}
 	}
 
 	var err error
 
 	// Open listener connection
-	s.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
+	s.listener, err = net.Listen("tcp", config.Address)
 	if err != nil {
-		return nil, err
+		s.log(LogLevelError, "%v", err)
+		return nil, errors.New(ErrorNewConnection)
 	}
 
 	go s.runTimer()
-	go s.startAcceptingConsumers()
+	go s.startAcceptingWorkers()
 
 	return s, nil
 
@@ -110,15 +113,15 @@ func (s *scheduler) AddJob(channel string, runAt time.Time, args map[string]inte
 	// Remove milliseconds
 	runAt = runAt.Truncate(1 * time.Second)
 
+	// Validate expired time
 	now := time.Now()
-
 	if now.Sub(runAt).Seconds() > 0 {
 		return "", errors.New(ErrorJobHasExpired)
 	}
 
 	job := &Job{
 		Channel: channel,
-		ID:      generateID(10),
+		ID:      fmt.Sprintf("%s-%s", channel, generateID(10)),
 		Args:    args,
 		RunAt:   runAt,
 	}
@@ -126,35 +129,46 @@ func (s *scheduler) AddJob(channel string, runAt time.Time, args map[string]inte
 	// Insert to storage if available
 	if s.storage != nil {
 		if err := s.storage.InsertJob(job); err != nil {
-			return "", err
+			s.log(LogLevelError, "%v", err)
+			return "", errors.New(ErrorInsertToStorage)
 		}
 	}
 
 	if isNewKey := s.insertToBatch(job); isNewKey {
-		s.newJobChan <- runAt
+		s.newJobChan <- true
 	}
 
 	return job.ID, nil
 
 }
 
-func (s *scheduler) Close() {
-
-	for i := range s.consumers {
-		s.consumers[i].heartbeatTicker.Stop()
-		s.consumers[i].protocol.Close()
+func (s *scheduler) Stop() {
+	s.closeMtx.Lock()
+	for i := range s.workers {
+		s.workers[i].heartbeatTicker.Stop()
+		s.workers[i].protocol.Close()
 	}
 
 	s.listener.Close()
+	s.closeMtx.Unlock()
 }
 
-func (s *scheduler) initializeActiveJobs() {
+func (s *scheduler) initializeActiveJobs() error {
 
-	activeJobs := s.storage.GetActiveJobs()
+	activeJobs, err := s.storage.GetActiveJobs()
+	if err != nil {
+		s.log(LogLevelError, "%v", err)
+		return errors.New(ErrorJobHasExpired)
+	}
+
 	for j := range activeJobs {
 		s.insertToBatch(activeJobs[j])
 	}
 
+	if len(activeJobs) > 0 {
+		s.newJobChan <- true
+	}
+	return nil
 }
 
 func (s *scheduler) runTimer() {
@@ -221,6 +235,7 @@ func (s *scheduler) runTimer() {
 
 				go func(jobs []*Job) {
 
+					// Process all jobs with goroutine
 					for j := range jobs {
 						go s.processJob(jobs[j])
 					}
@@ -230,6 +245,7 @@ func (s *scheduler) runTimer() {
 
 		case <-s.newJobChan:
 
+			// Stop timer and recalculate with latest job list
 			timer.Stop()
 
 		}
@@ -238,42 +254,15 @@ func (s *scheduler) runTimer() {
 
 }
 
-func (s *scheduler) closeConsumer(index int) {
+func (s *scheduler) stopWorker(index int) {
 
-	if len(s.consumers) <= index {
+	if len(s.workers) <= index {
 		return
 	}
 
-	s.consumers[index].protocol.Close()
+	s.workers[index].protocol.Close()
 
-	s.consumers = append(s.consumers[:index], s.consumers[index+1:]...)
-
-}
-
-func (c *consumer) sendHeartbeat() {
-
-	c.heartbeatTicker = time.NewTicker(1 * time.Second)
-
-	for range c.heartbeatTicker.C {
-		if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
-			c.heartbeatTicker.Stop()
-		}
-	}
-
-}
-
-func (s *scheduler) saveToActiveJobs(job *Job) error {
-
-	// Insert to storage if available
-	if s.storage != nil {
-		if err := s.storage.InsertJob(job); err != nil {
-			return err
-		}
-	}
-
-	s.insertToBatch(job)
-
-	return nil
+	s.workers = append(s.workers[:index], s.workers[index+1:]...)
 
 }
 
@@ -309,21 +298,20 @@ func (s *scheduler) processJob(job *Job) {
 	atomic.AddInt64(&ato, 1)
 
 	s.channelMapMtx.Lock()
-	consumerIdx := s.channelMap[job.Channel]
+	workers := s.channelMap[job.Channel]
 	s.channelMapMtx.Unlock()
 
-	// No consumer available
-	if len(consumerIdx) == 0 {
+	// No worker available
+	if len(workers) == 0 {
 
 	}
 
 	// Need to implement round robin
-	for ii := range consumerIdx {
+	for ii := range workers {
 
-		//encoded, _ := json.Marshal(job)
+		encoded, _ := json.Marshal(job)
 
-		if err := s.consumers[ii].protocol.WriteCommand(command.Job([]byte(`{"channel":"dead_channel","id":"463778310c0913d50819","args":{"a":"b"},"run_at":"2019-03-26T14:27:21+07:00"}`))); err != nil {
-
+		if err := s.workers[ii].protocol.WriteCommand(command.Job(encoded)); err != nil {
 			s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
 		} else {
 			break
@@ -333,37 +321,37 @@ func (s *scheduler) processJob(job *Job) {
 
 }
 
-func (s *scheduler) startAcceptingConsumers() {
+func (s *scheduler) startAcceptingWorkers() {
 
 	for {
 
 		// Listen for new connection
 		conn, err := s.listener.Accept()
 		if err != nil {
-			s.log(LogLevelError, "Failed listen to new worker: %v", err)
+			s.log(LogLevelError, "Failed to accept new worker: %v", err)
 			break
 		}
 
 		s.log(LogLevelInfo, "New worker at %s", conn.RemoteAddr().String())
 
-		// Create new consumer
-		newConsumer := &consumer{
-			index: len(s.consumers),
+		// Create new worker
+		newWorker := &workerConn{
+			index: len(s.workers),
 			protocol: newProtocol(ProtocolConfig{
 				Conn:          conn,
-				Index:         len(s.consumers),
+				Index:         len(s.workers),
 				Delegator:     s,
-				ReadDeadline:  5 * time.Second,
-				WriteDeadline: 5 * time.Second,
+				ReadDeadline:  3 * time.Second,
+				WriteDeadline: 3 * time.Second,
 			}),
 		}
 
 		// Set logger
-		newConsumer.protocol.SetLogger(s.logger, s.logLvl)
+		newWorker.protocol.SetLogger(s.logger, s.logLvl)
 
-		go newConsumer.sendHeartbeat()
+		go newWorker.sendHeartbeat()
 
-		s.consumers = append(s.consumers, newConsumer)
+		s.workers = append(s.workers, newWorker)
 
 	}
 
@@ -387,7 +375,7 @@ func (s *scheduler) registerNewChannel(index int, channel string) {
 	}
 
 	s.channelMap[channel] = append(s.channelMap[channel], index)
-	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.consumers[index].protocol.addr)
+	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.workers[index].protocol.addr)
 
 }
 
@@ -429,4 +417,16 @@ func (s *scheduler) OnRequestReceived(index int, data []byte) {
 	}
 }
 func (s *scheduler) OnJobReceived(data []byte) {}
-func (s *scheduler) OnIOError(index int)       { s.closeConsumer(index) }
+func (s *scheduler) OnIOError(index int)       { s.stopWorker(index) }
+
+func (c *workerConn) sendHeartbeat() {
+
+	c.heartbeatTicker = time.NewTicker(1 * time.Second)
+
+	for range c.heartbeatTicker.C {
+		if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
+			c.heartbeatTicker.Stop()
+		}
+	}
+
+}
