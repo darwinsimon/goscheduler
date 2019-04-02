@@ -14,8 +14,8 @@ import (
 	"github.com/darwinsimon/goscheduler/command"
 )
 
+// Scheduler is the core scheduling system that receives and processes jobs
 type Scheduler interface {
-	AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error)
 	Stop()
 }
 
@@ -27,7 +27,10 @@ type scheduler struct {
 
 	listener net.Listener
 
-	workers []*workerConn
+	clients      map[int]*clientConn
+	clientsMtx   sync.Mutex
+	clientsWG    sync.WaitGroup
+	totalClients int32
 
 	channelMap    map[string][]int
 	channelMapMtx sync.Mutex
@@ -36,18 +39,19 @@ type scheduler struct {
 	batchMap    map[string]*JobBatch
 	batchMapMtx sync.Mutex
 
-	newJobChan chan bool
+	resetTimerChan chan bool
+	closeTimerChan chan bool
 
-	closeMtx  sync.Mutex
-	closeChan chan bool
+	routineWG sync.WaitGroup
+	closeFlag int32
 }
 
-type workerConn struct {
+type clientConn struct {
 	index    int
 	channels []string
 	protocol *Protocol
 
-	heartbeatTicker *time.Ticker
+	closeChan chan bool
 }
 
 // SchedulerConfig contains every configuration to create a new Scheduler
@@ -69,7 +73,8 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		logger: config.Logger,
 		logLvl: config.LogLvl,
 
-		workers: []*workerConn{},
+		clients:    map[int]*clientConn{},
+		clientsMtx: sync.Mutex{},
 
 		channelMap:    map[string][]int{},
 		channelMapMtx: sync.Mutex{},
@@ -78,10 +83,8 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		batchMap:    map[string]*JobBatch{},
 		batchMapMtx: sync.Mutex{},
 
-		newJobChan: make(chan bool),
-
-		closeMtx:  sync.Mutex{},
-		closeChan: make(chan bool),
+		resetTimerChan: make(chan bool),
+		closeTimerChan: make(chan bool),
 	}
 
 	// Get jobs from storage if available
@@ -101,56 +104,50 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 	}
 
 	go s.runTimer()
-	go s.startAcceptingWorkers()
+
+	go s.startAcceptingClients()
 
 	return s, nil
 
 }
 
-// AddJob insert new job to scheduler
-func (s *scheduler) AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error) {
-
-	// Remove milliseconds
-	runAt = runAt.Truncate(1 * time.Second)
-
-	// Validate expired time
-	now := time.Now()
-	if now.Sub(runAt).Seconds() > 0 {
-		return "", errors.New(ErrorJobHasExpired)
-	}
-
-	job := &Job{
-		Channel: channel,
-		ID:      fmt.Sprintf("%s-%s", channel, generateID(10)),
-		Args:    args,
-		RunAt:   runAt,
-	}
-
-	// Insert to storage if available
-	if s.storage != nil {
-		if err := s.storage.InsertJob(job); err != nil {
-			s.log(LogLevelError, "%v", err)
-			return "", errors.New(ErrorInsertToStorage)
-		}
-	}
-
-	if isNewKey := s.insertToBatch(job); isNewKey {
-		s.newJobChan <- true
-	}
-
-	return job.ID, nil
-
-}
-
 func (s *scheduler) Stop() {
-	s.closeMtx.Lock()
-	for i := range s.workers {
-		s.workers[i].heartbeatTicker.Stop()
-		s.workers[i].protocol.Close()
+
+	if !atomic.CompareAndSwapInt32(&s.closeFlag, 0, 1) {
+		return
 	}
+
+	s.log(LogLevelInfo, "Stopping scheduler...")
+
+	go func() {
+		s.resetTimerChan <- true
+	}()
 
 	s.listener.Close()
-	s.closeMtx.Unlock()
+	s.routineWG.Wait()
+
+	for i := range s.clients {
+		go s.closeClientConn(i)
+	}
+
+	s.clientsWG.Wait()
+
+}
+func (s *scheduler) closeClientConn(i int) {
+
+	s.clientsMtx.Lock()
+	defer s.clientsMtx.Unlock()
+
+	if s.clients[i] == nil {
+		return
+	}
+
+	s.clients[i].protocol.Close()
+	s.clients[i].closeChan <- true
+
+	delete(s.clients, i)
+	s.clientsWG.Done()
+
 }
 
 func (s *scheduler) initializeActiveJobs() error {
@@ -161,19 +158,31 @@ func (s *scheduler) initializeActiveJobs() error {
 		return errors.New(ErrorJobHasExpired)
 	}
 
+	now := time.Now()
+
 	for j := range activeJobs {
+
+		// Validate expired time
+		if now.Sub(activeJobs[j].RunAt).Seconds() > 0 {
+			continue
+		}
+
 		s.insertToBatch(activeJobs[j])
 	}
 
-	if len(activeJobs) > 0 {
-		s.newJobChan <- true
-	}
 	return nil
 }
 
 func (s *scheduler) runTimer() {
 
+	s.routineWG.Add(1)
+
 	for {
+
+		if atomic.LoadInt32(&s.closeFlag) == 1 {
+			s.routineWG.Done()
+			return
+		}
 
 		var timer = time.NewTimer(100 * time.Hour)
 
@@ -197,12 +206,9 @@ func (s *scheduler) runTimer() {
 
 						timer.Stop()
 						timer = time.NewTimer(job.RunAt.Sub(now))
-
 						break
 					}
 
-				} else if nearestKey >= bk {
-					break
 				}
 
 			}
@@ -211,7 +217,6 @@ func (s *scheduler) runTimer() {
 
 		select {
 		case runTime := <-timer.C:
-
 			currentKey := runTime.Format("20060102150405")
 
 			s.batchMapMtx.Lock()
@@ -243,26 +248,13 @@ func (s *scheduler) runTimer() {
 				}(batch.Jobs)
 			}
 
-		case <-s.newJobChan:
-
+		case <-s.resetTimerChan:
 			// Stop timer and recalculate with latest job list
 			timer.Stop()
 
 		}
 
 	}
-
-}
-
-func (s *scheduler) stopWorker(index int) {
-
-	if len(s.workers) <= index {
-		return
-	}
-
-	s.workers[index].protocol.Close()
-
-	s.workers = append(s.workers[:index], s.workers[index+1:]...)
 
 }
 
@@ -291,11 +283,7 @@ func (s *scheduler) insertToBatch(job *Job) bool {
 
 }
 
-var ato int64
-
 func (s *scheduler) processJob(job *Job) {
-
-	atomic.AddInt64(&ato, 1)
 
 	s.channelMapMtx.Lock()
 	workers := s.channelMap[job.Channel]
@@ -303,43 +291,53 @@ func (s *scheduler) processJob(job *Job) {
 
 	// No worker available
 	if len(workers) == 0 {
-
 	}
 
 	// Need to implement round robin
-	for ii := range workers {
+	for _, ii := range workers {
 
 		encoded, _ := json.Marshal(job)
 
-		if err := s.workers[ii].protocol.WriteCommand(command.Job(encoded)); err != nil {
+		if err := s.clients[ii].protocol.WriteCommand(command.Job(encoded)); err != nil {
 			s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
 		} else {
 			break
 		}
+
 		break
 	}
 
 }
 
-func (s *scheduler) startAcceptingWorkers() {
+func (s *scheduler) startAcceptingClients() {
+
+	s.routineWG.Add(1)
 
 	for {
 
 		// Listen for new connection
 		conn, err := s.listener.Accept()
 		if err != nil {
-			s.log(LogLevelError, "Failed to accept new worker: %v", err)
+
+			// Error other than closed connection
+			if !strings.Contains(err.Error(), "use of closed network connection") {
+				s.log(LogLevelError, "Failed to accept new worker: %v", err)
+			}
+
 			break
 		}
 
+		newIndex := int(atomic.AddInt32(&s.totalClients, 1))
+
 		s.log(LogLevelInfo, "New worker at %s", conn.RemoteAddr().String())
 
-		// Create new worker
-		newWorker := &workerConn{
-			index: len(s.workers),
+		// Create new client
+		newClient := &clientConn{
+			index:     newIndex,
+			closeChan: make(chan bool),
 			protocol: newProtocol(ProtocolConfig{
 				Conn:          conn,
-				Index:         len(s.workers),
+				Index:         newIndex,
 				Delegator:     s,
 				ReadDeadline:  3 * time.Second,
 				WriteDeadline: 3 * time.Second,
@@ -347,18 +345,23 @@ func (s *scheduler) startAcceptingWorkers() {
 		}
 
 		// Set logger
-		newWorker.protocol.SetLogger(s.logger, s.logLvl)
+		newClient.protocol.SetLogger(s.logger, s.logLvl)
 
-		go newWorker.sendHeartbeat()
+		go newClient.sendHeartbeat()
 
-		s.workers = append(s.workers, newWorker)
+		s.clientsMtx.Lock()
+		s.clients[newIndex] = newClient
+		s.clientsMtx.Unlock()
+		s.clientsWG.Add(1)
 
 	}
+
+	s.routineWG.Done()
 
 }
 
 // add new channel to map
-func (s *scheduler) registerNewChannel(index int, channel string) {
+func (s *scheduler) registerNewChannel(index int, channel string, addr string) {
 
 	s.channelMapMtx.Lock()
 	defer s.channelMapMtx.Unlock()
@@ -370,12 +373,13 @@ func (s *scheduler) registerNewChannel(index int, channel string) {
 	// Check for duplicate index
 	for ch := range s.channelMap[channel] {
 		if s.channelMap[channel][ch] == index {
+			s.log(LogLevelWarning, "Duplicate channel registration %s for %s", channel, addr)
 			return
 		}
 	}
 
 	s.channelMap[channel] = append(s.channelMap[channel], index)
-	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.workers[index].protocol.addr)
+	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.clients[index].protocol.addr)
 
 }
 
@@ -391,17 +395,15 @@ func (s *scheduler) log(lvl LogLevel, line string, args ...interface{}) {
 	s.logger.Output(2, fmt.Sprintf("%-4s %s", lvl, fmt.Sprintf(line, args...)))
 }
 
-func (s *scheduler) OnConnClose() {
-	s.closeChan <- true
-}
-
-func (s *scheduler) OnRequestReceived(index int, data []byte) {
+func (s *scheduler) OnRequestReceived(index int, data []byte, addr string) {
 
 	strData := string(data)
 	commands := strings.Split(strData, " ")
 	if len(commands) == 0 {
+		s.log(LogLevelWarning, "Unknown command %s", strData)
 		return
 	}
+
 	switch commands[0] {
 	case command.CRegister:
 
@@ -410,23 +412,62 @@ func (s *scheduler) OnRequestReceived(index int, data []byte) {
 			return
 		}
 
-		s.registerNewChannel(index, commands[1])
+		s.registerNewChannel(index, commands[1], addr)
 
 	default:
 		s.log(LogLevelWarning, "Unknown command %s", strData)
 	}
 }
-func (s *scheduler) OnJobReceived(data []byte) {}
-func (s *scheduler) OnIOError(index int)       { s.stopWorker(index) }
 
-func (c *workerConn) sendHeartbeat() {
+// OnJobReceived new job from publisher
+func (s *scheduler) OnJobReceived(data []byte) {
 
-	c.heartbeatTicker = time.NewTicker(1 * time.Second)
+	job := &Job{}
+	if err := json.Unmarshal(data, job); err != nil {
+		s.log(LogLevelError, "Failed to read job %v", err)
+		return
+	}
 
-	for range c.heartbeatTicker.C {
-		if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
-			c.heartbeatTicker.Stop()
+	// Insert to storage if available
+	if s.storage != nil {
+		if err := s.storage.InsertJob(job); err != nil {
+			s.log(LogLevelError, "%v", err)
 		}
 	}
+
+	if isNewKey := s.insertToBatch(job); isNewKey {
+		s.resetTimerChan <- true
+	}
+
+}
+func (s *scheduler) OnIOError(index int) {
+
+	if atomic.LoadInt32(&s.closeFlag) == 0 {
+		s.closeClientConn(index)
+	}
+
+}
+
+func (c *clientConn) sendHeartbeat() {
+
+	ticker := time.NewTicker(5 * time.Second)
+
+	for {
+
+		select {
+		case <-ticker.C:
+
+			if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
+				goto exitLoop
+			}
+
+		case <-c.closeChan:
+			goto exitLoop
+		}
+	}
+
+exitLoop:
+
+	ticker.Stop()
 
 }

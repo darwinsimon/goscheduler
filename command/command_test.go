@@ -136,14 +136,6 @@ func TestHeartbeat(t *testing.T) {
 
 }
 
-func TestReady(t *testing.T) {
-
-	cmd := Ready()
-	assert.Equal(t, []byte(CReady), cmd.Name)
-	assert.Nil(t, cmd.Body)
-	assert.Equal(t, StreamTypeRequest, cmd.Type)
-
-}
 func TestRegister(t *testing.T) {
 
 	cmd := Register("foo")

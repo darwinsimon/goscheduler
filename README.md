@@ -1,9 +1,11 @@
 # GoScheduler - Under Development
 
-Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq, GoScheduler is a simple scheduler for Golang. It uses TCP connection to communicate between scheduler (server) and worker (client). 
+Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq, GoScheduler is a simple scheduler for Golang. It uses TCP connection to communicate between scheduler and client. 
 
 
 ## Scheduler
+Scheduler service serves as the main gateway for receiving and pushing jobs. You could add storage to save preserve jobs.
+
 ```golang
 
 	// Set your logger
@@ -24,38 +26,45 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 	}
 	defer sc.Stop()
 
-
-	// Adding new job
-	// will run in 5 seconds
-	sc.AddJob("channel_name", time.Now().Add(5*time.Second), map[string]interface{}{
-		"name": "foo",
-		"age": 28,
-	})
-
 ```
-## Worker
+
+## Client
+Client service serves as the job producer or consumer. 
+
 ```golang
 
 	// Set your logger
 	myLogger := log.New(os.Stderr, "", log.LstdFlags|log.Llongfile)
 
-	// Worker config
-	workerConfig := goscheduler.WorkerConfig{
+	// Client config
+	config := goscheduler.ClientConfig{
 		Address: "localhost:7000",
 
 		Logger: myLogger,
 		LogLvl: goscheduler.LogLevelDebug,
 	}
 
-	// Create worker instance
-	worker, err := goscheduler.NewWorker(workerConfig)
+	// Create client instance
+	client, err := goscheduler.NewClient(config)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer worker.Stop()
+	defer client.Stop()
 
-	// Register for new channel listener
-	worker.Register("channel_name", callback)
+	// -- As Producer
+
+	// Adding new job
+	// will run in 5 seconds
+	client.AddJob("channel_name", time.Now().Add(5*time.Second), map[string]interface{}{
+		"name": "foo",
+		"age": 28,
+	})
+
+
+	// -- As Consumer
+
+	// Register callback for new channel listener
+	client.Listen("channel_name", callback)
 
 
 	// Create callback function
@@ -64,5 +73,7 @@ Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq,
 		return nil
 	}
 
-
 ```
+
+## Storage
+-

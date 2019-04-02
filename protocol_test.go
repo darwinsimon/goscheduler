@@ -2,7 +2,9 @@ package goscheduler
 
 import (
 	"io/ioutil"
+	"log"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -17,10 +19,12 @@ type silentDelegator struct {
 	countOnJobReceived     int
 }
 
-func (s *silentDelegator) OnConnClose()                             {}
-func (s *silentDelegator) OnIOError(index int)                      { s.countIOError++ }
-func (s *silentDelegator) OnRequestReceived(index int, data []byte) { s.countOnRequestReceived++ }
-func (s *silentDelegator) OnJobReceived(data []byte)                { s.countOnJobReceived++ }
+func (s *silentDelegator) OnConnClose()        {}
+func (s *silentDelegator) OnIOError(index int) { s.countIOError++ }
+func (s *silentDelegator) OnRequestReceived(index int, data []byte, addr string) {
+	s.countOnRequestReceived++
+}
+func (s *silentDelegator) OnJobReceived(data []byte) { s.countOnJobReceived++ }
 
 func TestProtocolWriteCommand(t *testing.T) {
 
@@ -112,6 +116,7 @@ func TestProtocolReadLoop(t *testing.T) {
 		Delegator: dg,
 	}
 	p := newProtocol(config)
+	p.SetLogger(log.New(os.Stderr, "", log.LstdFlags), LogLevelError)
 
 	go func() {
 
@@ -131,6 +136,10 @@ func TestProtocolReadLoop(t *testing.T) {
 			job := command.Job([]byte("data"))
 			job.WriteTo(sw)
 		}
+
+		unknown := command.Heartbeat()
+		unknown.Type = byte('A')
+		unknown.WriteTo(sw)
 
 		sw.Close()
 

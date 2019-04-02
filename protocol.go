@@ -50,7 +50,7 @@ type ProtocolConfig struct {
 func newProtocol(config ProtocolConfig) *Protocol {
 
 	p := &Protocol{
-		addr: config.Conn.LocalAddr().String(),
+		addr: config.Conn.RemoteAddr().String(),
 
 		index: config.Index,
 		c:     config.Conn,
@@ -123,7 +123,9 @@ writeCommandExit:
 
 	if err != nil {
 		p.log(LogLevelError, "%s", err)
-		p.delegator.OnIOError(p.index)
+		if p.delegator != nil {
+			p.delegator.OnIOError(p.index)
+		}
 	}
 
 	return err
@@ -142,29 +144,32 @@ func (p *Protocol) readLoop() {
 		// Wait for any message
 		streamType, data, err := readResponse(p.r)
 		if err != nil {
-			p.log(LogLevelError, "Failed to read %v", err)
-			p.delegator.OnIOError(p.index)
+
+			if err.Error() == "EOF" {
+				p.log(LogLevelInfo, "Disconnected")
+			} else {
+				p.log(LogLevelError, "Failed to read %v", err)
+			}
+
+			if p.delegator != nil {
+				go p.delegator.OnIOError(p.index)
+			}
 
 			goto readLoopExit
 		}
 
-		go p.log(LogLevelDebug, "Received message %s", string(data))
-
 		switch streamType {
 		case command.StreamTypeHeartbeat:
-			break
 		case command.StreamTypeRequest:
-
-			p.delegator.OnRequestReceived(p.index, data)
-
-		case command.StreamTypeResponse:
-
-			// c.delegate.OnMessage(c, "msg")
-
+			if p.delegator != nil {
+				p.log(LogLevelDebug, "Received request stream %s", string(data))
+				p.delegator.OnRequestReceived(p.index, data, p.addr)
+			}
 		case command.StreamTypeJob:
-
-			p.delegator.OnJobReceived(data)
-
+			if p.delegator != nil {
+				p.log(LogLevelDebug, "Received job stream %s", string(data))
+				p.delegator.OnJobReceived(data)
+			}
 		default:
 
 			p.log(LogLevelError, "Unknown message", string(data))
@@ -173,26 +178,19 @@ func (p *Protocol) readLoop() {
 	}
 
 readLoopExit:
-
 	p.wg.Done()
-	p.Close()
 }
 
-// Close TCP connection and trigger delegator to prepare for closing
+// Close TCP connection
 func (p *Protocol) Close() {
 
 	if !atomic.CompareAndSwapInt32(&p.closeFlag, 0, 1) {
 		return
 	}
 
-	p.log(LogLevelInfo, "Closing connection...")
-
-	go p.delegator.OnConnClose()
-
 	p.c.Close()
 
 	p.wg.Wait()
-
 }
 
 func (p *Protocol) log(lvl LogLevel, line string, args ...interface{}) {

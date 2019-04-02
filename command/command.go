@@ -10,15 +10,13 @@ var byteSpace = []byte(" ")
 // Stream command type
 const (
 	StreamTypeRequest   byte = 1
-	StreamTypeResponse  byte = 2
-	StreamTypeJob       byte = 3
-	StreamTypeHeartbeat byte = 4
+	StreamTypeJob       byte = 2
+	StreamTypeHeartbeat byte = 3
 )
 
 // List of available command string
 const (
 	CHeartbeat = "HEARTBEAT"
-	CReady     = "READY"
 	CRegister  = "REG"
 )
 
@@ -94,18 +92,17 @@ func (c *Command) WriteTo(w io.Writer) (int, error) {
 
 }
 
+// Heartbeat command
 func Heartbeat() *Command {
 	return &Command{[]byte(CHeartbeat), nil, StreamTypeHeartbeat}
 }
 
-func Ready() *Command {
-	return &Command{[]byte(CReady), nil, StreamTypeRequest}
-}
-
+// Register command new channel to consume
 func Register(channel string) *Command {
 	return &Command{[]byte(CRegister), []byte(channel), StreamTypeRequest}
 }
 
+// Job command
 func Job(data []byte) *Command {
 	return &Command{nil, data, StreamTypeJob}
 }
