@@ -47,14 +47,16 @@ type scheduler struct {
 	jobMapMtx sync.Mutex
 
 	// Map of clients by channel's name
-	clientMap    map[string][]int
+	clientMap    map[string]*roundRobin
 	clientMapMtx sync.Mutex
 
 	routineWG sync.WaitGroup
 	closeFlag int32
 
 	resetTimerChan chan bool
-	closeTimerChan chan bool
+
+	readDeadline  time.Duration
+	writeDeadline time.Duration
 }
 
 type clientConn struct {
@@ -73,6 +75,9 @@ type SchedulerConfig struct {
 
 	Logger logger
 	LogLvl LogLevel
+
+	ReadDeadline  time.Duration
+	WriteDeadline time.Duration
 }
 
 // NewScheduler create new scheduler
@@ -89,15 +94,17 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		runAtKeys: []string{},
 		batchMap:  map[string]bool{},
 		jobMap:    map[string][]*Job{},
-		clientMap: map[string][]int{},
+		clientMap: map[string]*roundRobin{},
 
 		resetTimerChan: make(chan bool),
-		closeTimerChan: make(chan bool),
+
+		readDeadline:  config.ReadDeadline,
+		writeDeadline: config.WriteDeadline,
 	}
 
 	// Get jobs from storage if available
 	if s.storage != nil {
-		if err := s.initializeActiveJobs(); err != nil {
+		if err := s.initializeStorageJobs(); err != nil {
 			return nil, err
 		}
 	}
@@ -140,6 +147,8 @@ func (s *scheduler) Stop() {
 
 	s.clientsWG.Wait()
 
+	s.log(LogLevelInfo, "Scheduler has stopped")
+
 }
 func (s *scheduler) closeClientConn(i int) {
 
@@ -152,17 +161,9 @@ func (s *scheduler) closeClientConn(i int) {
 
 	s.clientMapMtx.Lock()
 	for _, channelName := range s.clients[i].channels {
-		for k := range s.clientMap[channelName] {
-			if i == s.clientMap[channelName][k] {
-				s.clientMap[channelName] = append(s.clientMap[channelName][:k], s.clientMap[channelName][k+1:]...)
-				goto exitCloseClientConn
-			}
-
-		}
-
+		s.clientMap[channelName].RemoveByValue(i)
 	}
 
-exitCloseClientConn:
 	s.clientMapMtx.Unlock()
 
 	s.clients[i].protocol.Close()
@@ -173,7 +174,7 @@ exitCloseClientConn:
 
 }
 
-func (s *scheduler) initializeActiveJobs() error {
+func (s *scheduler) initializeStorageJobs() error {
 
 	activeJobs, err := s.storage.GetActiveJobs()
 	if err != nil {
@@ -312,29 +313,32 @@ func (s *scheduler) insertToMap(job *Job) (isNewBatch bool) {
 }
 
 func (s *scheduler) processJob(job *Job) {
+
 	s.clientMapMtx.Lock()
-	workers := s.clientMap[job.Channel]
+	rr, ok := s.clientMap[job.Channel]
 	s.clientMapMtx.Unlock()
 
-	// No worker available
-	if len(workers) == 0 {
+	// No channel is registered
+	if !ok {
+		return
 	}
 
-	// Need to implement round robin
-	for _, ii := range workers {
+	// Get client
+	pickedIndex, err := rr.Pick()
 
-		encoded, _ := json.Marshal(job)
-
-		s.clientsMtx.Lock()
-		if err := s.clients[ii].protocol.WriteCommand(command.Job(encoded)); err != nil {
-			s.log(LogLevelError, "Push job %s %s", job.Channel, job.ID, err)
-		} else {
-			s.clientsMtx.Unlock()
-			break
-		}
-		s.clientsMtx.Unlock()
-		break
+	// No client is available
+	if err != nil {
+		s.log(LogLevelError, "Get client index %v", err)
+		return
 	}
+
+	encoded, _ := json.Marshal(job)
+
+	s.clientsMtx.Lock()
+	if err := s.clients[pickedIndex].protocol.WriteCommand(command.Job(encoded)); err != nil {
+		s.log(LogLevelError, "Push job %s %s", job.Channel, job.ID, err)
+	}
+	s.clientsMtx.Unlock()
 
 }
 
@@ -365,11 +369,12 @@ func (s *scheduler) startAcceptingClients() {
 			index:     newIndex,
 			closeChan: make(chan bool),
 			protocol: newProtocol(ProtocolConfig{
-				Conn:          conn,
-				Index:         newIndex,
-				Delegator:     s,
-				ReadDeadline:  3 * time.Second,
-				WriteDeadline: 3 * time.Second,
+				Conn:      conn,
+				Index:     newIndex,
+				Delegator: s,
+
+				ReadDeadline:  s.readDeadline,
+				WriteDeadline: s.writeDeadline,
 			}),
 		}
 
@@ -381,6 +386,7 @@ func (s *scheduler) startAcceptingClients() {
 		s.clientsMtx.Lock()
 		s.clients[newIndex] = newClient
 		s.clientsMtx.Unlock()
+
 		s.clientsWG.Add(1)
 
 	}
@@ -397,23 +403,21 @@ func (s *scheduler) registerNewChannel(index int, channel string, addr string) {
 
 	// Initialization for new key
 	if _, ok := s.clientMap[channel]; !ok {
-		s.clientMap[channel] = []int{}
+		s.clientMap[channel] = newRoundRobin()
 	}
 
-	// Check for duplicate index
-	for ch := range s.clientMap[channel] {
-		if s.clientMap[channel][ch] == index {
-			s.log(LogLevelWarning, "Duplicate channel registration %s for %s", channel, addr)
-			return
-		}
+	// Prevent duplicate registration
+	if s.clientMap[channel].IsDuplicate(index) {
+		s.log(LogLevelWarning, "Duplicate channel registration %s for %s", channel, addr)
+		return
 	}
 
 	s.clientsMtx.Lock()
 	s.clients[index].channels = append(s.clients[index].channels, channel)
+	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.clients[index].protocol.addr)
 	s.clientsMtx.Unlock()
 
-	s.clientMap[channel] = append(s.clientMap[channel], index)
-	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.clients[index].protocol.addr)
+	s.clientMap[channel].Add(index)
 
 }
 

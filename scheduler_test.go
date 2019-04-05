@@ -62,7 +62,7 @@ func TestSchedulerNewTCPError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestSchedulerInitializeActiveJobsError(t *testing.T) {
+func TestSchedulerInitializeStorageJobsError(t *testing.T) {
 
 	address := ":8891"
 	config := SchedulerConfig{
