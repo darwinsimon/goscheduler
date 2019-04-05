@@ -148,7 +148,7 @@ func (p *Protocol) readLoop() {
 			if err.Error() == "EOF" {
 				p.log(LogLevelInfo, "Disconnected")
 			} else {
-				p.log(LogLevelError, "Failed to read %v", err)
+				p.log(LogLevelError, "Read %v", err)
 			}
 
 			if p.delegator != nil {
@@ -167,7 +167,7 @@ func (p *Protocol) readLoop() {
 			}
 		case command.StreamTypeJob:
 			if p.delegator != nil {
-				p.log(LogLevelDebug, "Received job stream %s", string(data))
+				// p.log(LogLevelDebug, "Received job stream %s", string(data))
 				p.delegator.OnJobReceived(data)
 			}
 		default:

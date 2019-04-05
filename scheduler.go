@@ -14,6 +14,8 @@ import (
 	"github.com/darwinsimon/goscheduler/command"
 )
 
+var batchTimeLayout = "20060102150405MST"
+
 // Scheduler is the core scheduling system that receives and processes jobs
 type Scheduler interface {
 	Stop()
@@ -27,23 +29,32 @@ type scheduler struct {
 
 	listener net.Listener
 
+	// Map of connection by client ID's
 	clients      map[int]*clientConn
 	clientsMtx   sync.Mutex
 	clientsWG    sync.WaitGroup
 	totalClients int32
 
-	channelMap    map[string][]int
-	channelMapMtx sync.Mutex
+	// List of sorted runAt
+	runAtKeys []string
 
-	batchKeys   []string
-	batchMap    map[string]*JobBatch
+	// Flags for runAt key
+	batchMap    map[string]bool
 	batchMapMtx sync.Mutex
 
-	resetTimerChan chan bool
-	closeTimerChan chan bool
+	// Map of jobs by runAt
+	jobMap    map[string][]*Job
+	jobMapMtx sync.Mutex
+
+	// Map of clients by channel's name
+	clientMap    map[string][]int
+	clientMapMtx sync.Mutex
 
 	routineWG sync.WaitGroup
 	closeFlag int32
+
+	resetTimerChan chan bool
+	closeTimerChan chan bool
 }
 
 type clientConn struct {
@@ -73,15 +84,12 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		logger: config.Logger,
 		logLvl: config.LogLvl,
 
-		clients:    map[int]*clientConn{},
-		clientsMtx: sync.Mutex{},
+		clients: map[int]*clientConn{},
 
-		channelMap:    map[string][]int{},
-		channelMapMtx: sync.Mutex{},
-
-		batchKeys:   []string{},
-		batchMap:    map[string]*JobBatch{},
-		batchMapMtx: sync.Mutex{},
+		runAtKeys: []string{},
+		batchMap:  map[string]bool{},
+		jobMap:    map[string][]*Job{},
+		clientMap: map[string][]int{},
 
 		resetTimerChan: make(chan bool),
 		closeTimerChan: make(chan bool),
@@ -142,6 +150,21 @@ func (s *scheduler) closeClientConn(i int) {
 		return
 	}
 
+	s.clientMapMtx.Lock()
+	for _, channelName := range s.clients[i].channels {
+		for k := range s.clientMap[channelName] {
+			if i == s.clientMap[channelName][k] {
+				s.clientMap[channelName] = append(s.clientMap[channelName][:k], s.clientMap[channelName][k+1:]...)
+				goto exitCloseClientConn
+			}
+
+		}
+
+	}
+
+exitCloseClientConn:
+	s.clientMapMtx.Unlock()
+
 	s.clients[i].protocol.Close()
 	s.clients[i].closeChan <- true
 
@@ -167,7 +190,7 @@ func (s *scheduler) initializeActiveJobs() error {
 			continue
 		}
 
-		s.insertToBatch(activeJobs[j])
+		s.insertToMap(activeJobs[j])
 	}
 
 	return nil
@@ -187,27 +210,20 @@ func (s *scheduler) runTimer() {
 		var timer = time.NewTimer(100 * time.Hour)
 
 		now := time.Now()
-		nearestKey := now.Format("20060102150405")
+		nearestKey := now.Format(batchTimeLayout)
 
-		sort.Strings(s.batchKeys)
-
-		if len(s.batchKeys) > 0 {
+		if len(s.runAtKeys) > 0 {
 
 			// Get nearest and not expired schedule
-			for _, bk := range s.batchKeys {
+			for _, bk := range s.runAtKeys {
 
 				if nearestKey < bk {
 
-					s.batchMapMtx.Lock()
-					job, ok := s.batchMap[bk]
-					s.batchMapMtx.Unlock()
+					earliestTime, _ := time.Parse(batchTimeLayout, bk)
 
-					if ok {
-
-						timer.Stop()
-						timer = time.NewTimer(job.RunAt.Sub(now))
-						break
-					}
+					timer.Stop()
+					timer = time.NewTimer(earliestTime.Sub(now))
+					break
 
 				}
 
@@ -217,21 +233,27 @@ func (s *scheduler) runTimer() {
 
 		select {
 		case runTime := <-timer.C:
-			currentKey := runTime.Format("20060102150405")
+
+			currentKey := runTime.Format(batchTimeLayout)
+			s.log(LogLevelDebug, "Run for time %s", currentKey)
 
 			s.batchMapMtx.Lock()
-			batch, ok := s.batchMap[currentKey]
 			delete(s.batchMap, currentKey)
 			s.batchMapMtx.Unlock()
+
+			s.jobMapMtx.Lock()
+			jbs, ok := s.jobMap[currentKey]
+			delete(s.jobMap, currentKey)
+			s.jobMapMtx.Unlock()
 
 			if ok {
 
 				go func() {
 
 					// Remove batch key from array
-					for k := range s.batchKeys {
-						if currentKey == s.batchKeys[k] {
-							s.batchKeys = append(s.batchKeys[:k], s.batchKeys[k+1:]...)
+					for k := range s.runAtKeys {
+						if currentKey == s.runAtKeys[k] {
+							s.runAtKeys = append(s.runAtKeys[:k], s.runAtKeys[k+1:]...)
 							break
 						}
 					}
@@ -245,7 +267,7 @@ func (s *scheduler) runTimer() {
 						go s.processJob(jobs[j])
 					}
 
-				}(batch.Jobs)
+				}(jbs)
 			}
 
 		case <-s.resetTimerChan:
@@ -258,36 +280,42 @@ func (s *scheduler) runTimer() {
 
 }
 
-func (s *scheduler) insertToBatch(job *Job) bool {
+func (s *scheduler) insertToMap(job *Job) (isNewBatch bool) {
 
-	var isNewKey bool
+	batchKey := job.RunAt.Format(batchTimeLayout)
 
-	batchKey := job.RunAt.Format("20060102150405")
-
+	// Check for new batch
 	s.batchMapMtx.Lock()
-	defer s.batchMapMtx.Unlock()
-
-	// Initialize new batch
 	if _, ok := s.batchMap[batchKey]; !ok {
-		s.batchMap[batchKey] = &JobBatch{
-			RunAt: job.RunAt,
-			Jobs:  []*Job{},
-		}
-		s.batchKeys = append(s.batchKeys, batchKey)
-		isNewKey = true
+		s.batchMap[batchKey] = true
+
+		// Insert new batch
+		s.runAtKeys = append(s.runAtKeys, batchKey)
+
+		// Sort by the nearest schedule
+		sort.Strings(s.runAtKeys)
+
+		isNewBatch = true
 	}
+	s.batchMapMtx.Unlock()
 
-	s.batchMap[batchKey].Jobs = append(s.batchMap[batchKey].Jobs, job)
+	// Insert to job map
+	s.jobMapMtx.Lock()
+	if _, ok := s.jobMap[batchKey]; !ok {
+		s.jobMap[batchKey] = []*Job{}
+	}
+	s.jobMap[batchKey] = append(s.jobMap[batchKey], job)
+	s.jobMapMtx.Unlock()
 
-	return isNewKey
+	return
 
 }
 
 func (s *scheduler) processJob(job *Job) {
-
-	s.channelMapMtx.Lock()
-	workers := s.channelMap[job.Channel]
-	s.channelMapMtx.Unlock()
+	atomic.AddInt32(&ato, 1)
+	s.clientMapMtx.Lock()
+	workers := s.clientMap[job.Channel]
+	s.clientMapMtx.Unlock()
 
 	// No worker available
 	if len(workers) == 0 {
@@ -298,12 +326,14 @@ func (s *scheduler) processJob(job *Job) {
 
 		encoded, _ := json.Marshal(job)
 
+		s.clientsMtx.Lock()
 		if err := s.clients[ii].protocol.WriteCommand(command.Job(encoded)); err != nil {
-			s.log(LogLevelError, "Failed to push job %s %s", job.Channel, job.ID)
+			s.log(LogLevelError, "Push job %s %s", job.Channel, job.ID, err)
 		} else {
+			s.clientsMtx.Unlock()
 			break
 		}
-
+		s.clientsMtx.Unlock()
 		break
 	}
 
@@ -321,7 +351,7 @@ func (s *scheduler) startAcceptingClients() {
 
 			// Error other than closed connection
 			if !strings.Contains(err.Error(), "use of closed network connection") {
-				s.log(LogLevelError, "Failed to accept new worker: %v", err)
+				s.log(LogLevelError, "Accept connection: %v", err)
 			}
 
 			break
@@ -363,22 +393,27 @@ func (s *scheduler) startAcceptingClients() {
 // add new channel to map
 func (s *scheduler) registerNewChannel(index int, channel string, addr string) {
 
-	s.channelMapMtx.Lock()
-	defer s.channelMapMtx.Unlock()
+	s.clientMapMtx.Lock()
+	defer s.clientMapMtx.Unlock()
 
-	if _, ok := s.channelMap[channel]; !ok {
-		s.channelMap[channel] = []int{}
+	// Initialization for new key
+	if _, ok := s.clientMap[channel]; !ok {
+		s.clientMap[channel] = []int{}
 	}
 
 	// Check for duplicate index
-	for ch := range s.channelMap[channel] {
-		if s.channelMap[channel][ch] == index {
+	for ch := range s.clientMap[channel] {
+		if s.clientMap[channel][ch] == index {
 			s.log(LogLevelWarning, "Duplicate channel registration %s for %s", channel, addr)
 			return
 		}
 	}
 
-	s.channelMap[channel] = append(s.channelMap[channel], index)
+	s.clientsMtx.Lock()
+	s.clients[index].channels = append(s.clients[index].channels, channel)
+	s.clientsMtx.Unlock()
+
+	s.clientMap[channel] = append(s.clientMap[channel], index)
 	s.log(LogLevelInfo, "Registered channel %s for %s", channel, s.clients[index].protocol.addr)
 
 }
@@ -424,7 +459,7 @@ func (s *scheduler) OnJobReceived(data []byte) {
 
 	job := &Job{}
 	if err := json.Unmarshal(data, job); err != nil {
-		s.log(LogLevelError, "Failed to read job %v", err)
+		s.log(LogLevelError, "Read job %v", err)
 		return
 	}
 
@@ -435,7 +470,7 @@ func (s *scheduler) OnJobReceived(data []byte) {
 		}
 	}
 
-	if isNewKey := s.insertToBatch(job); isNewKey {
+	if isNewKey := s.insertToMap(job); isNewKey {
 		s.resetTimerChan <- true
 	}
 

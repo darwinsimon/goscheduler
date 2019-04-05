@@ -85,13 +85,13 @@ func (c *client) Listen(channel string, f ClientCallbackFunc) error {
 		return errors.New(ErrorClosedConnection)
 	}
 
-	c.funcs[channel] = f
-
 	// Send Register command to Scheduler
 	if err := c.protocol.WriteCommand(command.Register(channel)); err != nil {
-		c.log(LogLevelError, "Failed to register channel %v", err)
+		c.log(LogLevelError, "Register channel %v", err)
 		return err
 	}
+
+	c.funcs[channel] = f
 
 	return nil
 
@@ -126,7 +126,7 @@ func (c *client) AddJob(channel string, runAt time.Time, args map[string]interfa
 	// Push to scheduler
 	encoded, _ := json.Marshal(job)
 	if err := c.protocol.WriteCommand(command.Job(encoded)); err != nil {
-		c.log(LogLevelError, "Failed to publish job %v", err)
+		c.log(LogLevelError, "Publish job %v", err)
 		return err
 	}
 
@@ -167,7 +167,7 @@ func (c *client) OnJobReceived(data []byte) {
 
 	job := &Job{}
 	if err := json.Unmarshal(data, job); err != nil {
-		c.log(LogLevelError, "Failed to read job %s", strData)
+		c.log(LogLevelError, "Read job %s", strData, err)
 		return
 	}
 

@@ -77,6 +77,52 @@ func TestSchedulerInitializeActiveJobsError(t *testing.T) {
 
 }
 
+func TestSchedulerDuplicateListener(t *testing.T) {
+
+	address := ":8890"
+	config := SchedulerConfig{
+		Address: address,
+		Storage: &testStorage{},
+
+		Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+		LogLvl: LogLevelDebug,
+	}
+
+	sc, err := NewScheduler(config)
+	defer sc.Stop()
+
+	assert.NotNil(t, sc)
+	assert.Nil(t, err)
+
+	// Producer
+	p, err := NewClient(ClientConfig{
+		Address: address,
+	})
+	defer p.Close()
+
+	assert.NotNil(t, p)
+	assert.Nil(t, err)
+
+	// Worker
+	w, err := NewClient(ClientConfig{
+		Address: address,
+	})
+	defer w.Close()
+
+	assert.NotNil(t, w)
+	assert.Nil(t, err)
+
+	assert.Nil(t, w.Listen("foo", func(job *Job) error {
+		return nil
+	}))
+
+	// Duplicate channel registration
+	assert.Nil(t, w.Listen("foo", func(job *Job) error {
+		return nil
+	}))
+
+}
+
 func TestSchedulerFullFlow(t *testing.T) {
 
 	address := ":8890"
@@ -106,9 +152,6 @@ func TestSchedulerFullFlow(t *testing.T) {
 	// Worker
 	w, err := NewClient(ClientConfig{
 		Address: address,
-
-		//Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
-		//LogLvl: LogLevelDebug,
 	})
 	defer w.Close()
 

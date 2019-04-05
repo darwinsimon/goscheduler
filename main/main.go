@@ -63,8 +63,8 @@ func main() {
 
 			Address: ":7000",
 
-			Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
-			LogLvl: goscheduler.LogLevelDebug,
+			//Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+			//LogLvl: goscheduler.LogLevelDebug,
 		}
 
 		pb, err := goscheduler.NewClient(config)
@@ -78,16 +78,29 @@ func main() {
 		})
 
 		// Insert new job
-		for i := 1; i <= 10; i++ {
+		for i := 1; i <= 100000; i++ {
 
-			// t, _ := time.Parse("20060102150405 MST", "20190326135345 WIB")
-
-			// time.Now().Add((3*time.Second)+time.Duration(i%10)*time.Second)
-			pb.AddJob("do_something", time.Now().Add(3*time.Second), map[string]interface{}{
+			pb.AddJob("do_something", time.Now().Add(4*time.Second), map[string]interface{}{
 				"c": fmt.Sprintf("%d", i),
 			})
 
 		}
+
+		log.Println("Selesai")
+
+		ticker := time.NewTicker(500 * time.Millisecond)
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+
+					//	pb.AddJob("do_something", time.Now().Add(time.Second), map[string]interface{}{
+					//		"c": fmt.Sprintf("%d", 99999999),
+					//	})
+
+				}
+			}
+		}()
 	}
 
 	exitChan = make(chan int, 1)
