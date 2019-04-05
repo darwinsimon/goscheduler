@@ -312,7 +312,6 @@ func (s *scheduler) insertToMap(job *Job) (isNewBatch bool) {
 }
 
 func (s *scheduler) processJob(job *Job) {
-	atomic.AddInt32(&ato, 1)
 	s.clientMapMtx.Lock()
 	workers := s.clientMap[job.Channel]
 	s.clientMapMtx.Unlock()
