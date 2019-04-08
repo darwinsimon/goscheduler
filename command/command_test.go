@@ -145,6 +145,15 @@ func TestRegister(t *testing.T) {
 
 }
 
+func TestRemove(t *testing.T) {
+
+	cmd := Remove("channel", "id")
+	assert.Equal(t, []byte(CRemove), cmd.Name)
+	assert.Equal(t, []byte("channel id"), cmd.Body)
+	assert.Equal(t, StreamTypeRequest, cmd.Type)
+
+}
+
 func TestJob(t *testing.T) {
 
 	cmd := Job([]byte("data"))

@@ -10,4 +10,10 @@ const (
 
 	// ErrorClosedConnection : Error occured because the connection is already closed
 	ErrorClosedConnection = "Using closed connection"
+
+	// ErrorInvalidChannelName : A valid channel name must contain alphabets, numbers, or underscore
+	ErrorInvalidChannelName = "Invalid channel name"
+
+	// ErrorInvalidJobID : A valid channel name must contain alphabets or numbers
+	ErrorInvalidJobID = "Invalid Job ID"
 )

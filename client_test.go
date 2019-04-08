@@ -111,6 +111,7 @@ func TestClientOnJobReceived(t *testing.T) {
 	assert.Nil(t, err)
 
 	cb := &callback{}
+	assert.EqualError(t, wk.Listen("$", cb.testCallback), ErrorInvalidChannelName)
 	assert.Nil(t, wk.Listen("bar", cb.testCallback))
 
 	<-exitChan
@@ -134,33 +135,107 @@ func TestClientAddJob(t *testing.T) {
 	}
 
 	p, err := NewClient(config)
-	defer p.Close()
 
 	assert.NotNil(t, p)
 	assert.Nil(t, err)
 
 	tcs := []struct {
-		name  string
-		runAt time.Time
-		err   error
+		name    string
+		channel string
+		runAt   time.Time
+		err     error
 	}{
 		{
-			name:  "Expired job",
-			runAt: time.Now().AddDate(0, 0, -1),
-			err:   errors.New(ErrorJobHasExpired),
+			name:  "Empty channel",
+			runAt: time.Now().AddDate(0, 0, 1),
+			err:   errors.New(ErrorInvalidChannelName),
 		},
 		{
-			name:  "Success",
-			runAt: time.Now().AddDate(0, 0, 1),
-			err:   nil,
+			name:    "Wrong channel name",
+			channel: "*",
+			runAt:   time.Now().AddDate(0, 0, 1),
+			err:     errors.New(ErrorInvalidChannelName),
+		},
+		{
+			name:    "Expired job",
+			channel: "foo21",
+			runAt:   time.Now().AddDate(0, 0, -1),
+			err:     errors.New(ErrorJobHasExpired),
+		},
+		{
+			name:    "Success",
+			channel: "foo_bar",
+			runAt:   time.Now().AddDate(0, 0, 1),
+			err:     nil,
 		},
 	}
 
 	for _, tc := range tcs {
-		err := p.AddJob("foo", tc.runAt, map[string]interface{}{})
+		_, err := p.AddJob(tc.channel, tc.runAt, map[string]interface{}{})
 		assert.Equal(t, err, tc.err)
 	}
 
+	p.Close()
+	_, err = p.AddJob("channel", time.Now(), map[string]interface{}{})
+	assert.EqualError(t, err, ErrorClosedConnection)
+}
+
+func TestClientRemoveJob(t *testing.T) {
+
+	address := ":12340"
+
+	// Open local connection
+	listener, _ := net.Listen("tcp", address)
+	defer listener.Close()
+
+	config := ClientConfig{
+		Address: address,
+
+		Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+		LogLvl: LogLevelDebug,
+	}
+
+	p, err := NewClient(config)
+
+	assert.NotNil(t, p)
+	assert.Nil(t, err)
+
+	tcs := []struct {
+		name    string
+		channel string
+		id      string
+		runAt   time.Time
+		err     error
+	}{
+		{
+			name: "Empty channel",
+			err:  errors.New(ErrorInvalidChannelName),
+		},
+		{
+			name:    "Wrong channel name",
+			channel: "*",
+			err:     errors.New(ErrorInvalidChannelName),
+		},
+		{
+			name:    "Wrong job id",
+			channel: "foo_bar",
+			err:     errors.New(ErrorInvalidJobID),
+		},
+		{
+			name:    "Wrong job id",
+			channel: "foo",
+			id:      "bar",
+			err:     nil,
+		},
+	}
+
+	for _, tc := range tcs {
+		err := p.RemoveJob(tc.channel, tc.id)
+		assert.Equal(t, err, tc.err)
+	}
+
+	p.Close()
+	assert.EqualError(t, p.RemoveJob("channel", "id"), ErrorClosedConnection)
 }
 
 func TestClientAddJobOnClosedScheduler(t *testing.T) {
@@ -182,7 +257,7 @@ func TestClientAddJobOnClosedScheduler(t *testing.T) {
 	assert.NotNil(t, p)
 	assert.Nil(t, err)
 
-	err = p.AddJob("foo", time.Now().AddDate(0, 0, 1), map[string]interface{}{})
+	_, err = p.AddJob("foo", time.Now().AddDate(0, 0, 1), map[string]interface{}{})
 	assert.Error(t, err)
 
 	p.Close()

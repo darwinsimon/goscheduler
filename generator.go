@@ -3,6 +3,7 @@ package goscheduler
 import (
 	"crypto/rand"
 	"fmt"
+	"regexp"
 )
 
 // generate id from random hex
@@ -16,3 +17,5 @@ func generateID(size int) string {
 
 	return fmt.Sprintf("%x", bytes)
 }
+
+var isAlphaNumeric = regexp.MustCompile(`^\w+$`).MatchString

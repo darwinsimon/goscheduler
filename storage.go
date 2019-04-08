@@ -6,4 +6,5 @@ type Storage interface {
 	GetJob(id string) (job *Job, err error)
 	InsertJob(job *Job) error
 	SetJobAsFinished(id string) error
+	RemoveJob(job *Job) error
 }

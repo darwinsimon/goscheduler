@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
@@ -43,8 +44,12 @@ type scheduler struct {
 	batchMapMtx sync.Mutex
 
 	// Map of jobs by runAt
-	jobMap    map[string][]*Job
-	jobMapMtx sync.Mutex
+	jobByTimeMap    map[string][]*Job
+	jobByTimeMapMtx sync.Mutex
+
+	// Map of jobs by id and channel
+	jobChannelMap    map[string]*Job
+	jobChannelMapMtx sync.Mutex
 
 	// Map of clients by channel's name
 	clientMap    map[string]*roundRobin
@@ -91,10 +96,11 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 
 		clients: map[int]*clientConn{},
 
-		runAtKeys: []string{},
-		batchMap:  map[string]bool{},
-		jobMap:    map[string][]*Job{},
-		clientMap: map[string]*roundRobin{},
+		runAtKeys:     []string{},
+		batchMap:      map[string]bool{},
+		jobByTimeMap:  map[string][]*Job{},
+		jobChannelMap: map[string]*Job{},
+		clientMap:     map[string]*roundRobin{},
 
 		resetTimerChan: make(chan bool),
 
@@ -141,9 +147,11 @@ func (s *scheduler) Stop() {
 	s.listener.Close()
 	s.routineWG.Wait()
 
+	s.clientsMtx.Lock()
 	for i := range s.clients {
 		go s.closeClientConn(i)
 	}
+	s.clientsMtx.Unlock()
 
 	s.clientsWG.Wait()
 
@@ -242,10 +250,10 @@ func (s *scheduler) runTimer() {
 			delete(s.batchMap, currentKey)
 			s.batchMapMtx.Unlock()
 
-			s.jobMapMtx.Lock()
-			jbs, ok := s.jobMap[currentKey]
-			delete(s.jobMap, currentKey)
-			s.jobMapMtx.Unlock()
+			s.jobByTimeMapMtx.Lock()
+			jbs, ok := s.jobByTimeMap[currentKey]
+			delete(s.jobByTimeMap, currentKey)
+			s.jobByTimeMapMtx.Unlock()
 
 			if ok {
 
@@ -265,7 +273,9 @@ func (s *scheduler) runTimer() {
 
 					// Process all jobs with goroutine
 					for j := range jobs {
-						go s.processJob(jobs[j])
+						if jobs[j].Status == JobStatusActive {
+							go s.processJob(jobs[j])
+						}
 					}
 
 				}(jbs)
@@ -301,12 +311,16 @@ func (s *scheduler) insertToMap(job *Job) (isNewBatch bool) {
 	s.batchMapMtx.Unlock()
 
 	// Insert to job map
-	s.jobMapMtx.Lock()
-	if _, ok := s.jobMap[batchKey]; !ok {
-		s.jobMap[batchKey] = []*Job{}
+	s.jobByTimeMapMtx.Lock()
+	if _, ok := s.jobByTimeMap[batchKey]; !ok {
+		s.jobByTimeMap[batchKey] = []*Job{}
 	}
-	s.jobMap[batchKey] = append(s.jobMap[batchKey], job)
-	s.jobMapMtx.Unlock()
+	s.jobByTimeMap[batchKey] = append(s.jobByTimeMap[batchKey], job)
+	s.jobByTimeMapMtx.Unlock()
+
+	s.jobChannelMapMtx.Lock()
+	s.jobChannelMap[job.Channel+" "+job.ID] = job
+	s.jobChannelMapMtx.Unlock()
 
 	return
 
@@ -319,7 +333,8 @@ func (s *scheduler) processJob(job *Job) {
 	s.clientMapMtx.Unlock()
 
 	// No channel is registered
-	if !ok {
+	if !ok || job.Status != JobStatusActive {
+		log.Println(job)
 		return
 	}
 
@@ -421,6 +436,33 @@ func (s *scheduler) registerNewChannel(index int, channel string, addr string) {
 
 }
 
+func (s *scheduler) removeJob(channel, id string) {
+
+	s.jobChannelMapMtx.Lock()
+	job, ok := s.jobChannelMap[channel+" "+id]
+	s.jobChannelMapMtx.Unlock()
+
+	if ok {
+
+		job.Status = JobStatusInactive
+
+		s.jobChannelMapMtx.Lock()
+		delete(s.jobChannelMap, channel+" "+id)
+		s.jobChannelMapMtx.Unlock()
+
+		if s.storage != nil {
+			if err := s.storage.RemoveJob(job); err != nil {
+				s.log(LogLevelError, "Remove job %s %s %v", channel, id, err)
+			} else {
+				s.log(LogLevelDebug, "Removed job %s %s", channel, id)
+			}
+		}
+
+	} else {
+		s.log(LogLevelError, "Job not found job %s %s", channel, id)
+	}
+}
+
 func (s *scheduler) log(lvl LogLevel, line string, args ...interface{}) {
 	if s.logger == nil {
 		return
@@ -451,6 +493,15 @@ func (s *scheduler) OnRequestReceived(index int, data []byte, addr string) {
 		}
 
 		s.registerNewChannel(index, commands[1], addr)
+
+	case command.CRemove:
+
+		if len(commands) != 3 {
+			s.log(LogLevelWarning, "Wrong REMOVE command %s", strData)
+			return
+		}
+
+		s.removeJob(commands[1], commands[2])
 
 	default:
 		s.log(LogLevelWarning, "Unknown command %s", strData)

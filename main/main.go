@@ -73,9 +73,11 @@ func main() {
 		}
 		defer pb.Close()
 
-		pb.AddJob("dead_channel", time.Now().Add(1*time.Second), map[string]interface{}{
+		id, _ := pb.AddJob("dead_channel", time.Now().Add(2*time.Second), map[string]interface{}{
 			"a": "b",
 		})
+
+		pb.RemoveJob("dead_channel", id)
 
 		// Insert new job
 		for i := 1; i <= 100000; i++ {
@@ -86,7 +88,7 @@ func main() {
 
 		}
 
-		log.Println("Selesai")
+		log.Println("Finished")
 
 		ticker := time.NewTicker(500 * time.Millisecond)
 		go func() {

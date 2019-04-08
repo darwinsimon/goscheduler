@@ -18,6 +18,7 @@ const (
 const (
 	CHeartbeat = "HEARTBEAT"
 	CRegister  = "REG"
+	CRemove    = "REMOVE"
 )
 
 type Command struct {
@@ -100,6 +101,11 @@ func Heartbeat() *Command {
 // Register command new channel to consume
 func Register(channel string) *Command {
 	return &Command{[]byte(CRegister), []byte(channel), StreamTypeRequest}
+}
+
+// Remove command remove job based on id and channel
+func Remove(channel, id string) *Command {
+	return &Command{[]byte(CRemove), []byte(channel + " " + id), StreamTypeRequest}
 }
 
 // Job command

@@ -13,8 +13,9 @@ import (
 
 // A Client interface provides all functions for add and consume jobs
 type Client interface {
-	AddJob(channel string, runAt time.Time, args map[string]interface{}) error
+	AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error)
 	Listen(channel string, f ClientCallbackFunc) error
+	RemoveJob(channel, id string) error
 	Close()
 }
 
@@ -85,6 +86,10 @@ func (c *client) Listen(channel string, f ClientCallbackFunc) error {
 		return errors.New(ErrorClosedConnection)
 	}
 
+	if !isAlphaNumeric(channel) {
+		return errors.New(ErrorInvalidChannelName)
+	}
+
 	// Send Register command to Scheduler
 	if err := c.protocol.WriteCommand(command.Register(channel)); err != nil {
 		c.log(LogLevelError, "Register channel %v", err)
@@ -98,10 +103,14 @@ func (c *client) Listen(channel string, f ClientCallbackFunc) error {
 }
 
 // AddJob insert new job to scheduler
-func (c *client) AddJob(channel string, runAt time.Time, args map[string]interface{}) error {
+func (c *client) AddJob(channel string, runAt time.Time, args map[string]interface{}) (string, error) {
 
 	if atomic.LoadInt32(&c.closeFlag) == 1 {
-		return errors.New(ErrorClosedConnection)
+		return "", errors.New(ErrorClosedConnection)
+	}
+
+	if !isAlphaNumeric(channel) {
+		return "", errors.New(ErrorInvalidChannelName)
 	}
 
 	// Remove milliseconds
@@ -111,14 +120,16 @@ func (c *client) AddJob(channel string, runAt time.Time, args map[string]interfa
 	now := time.Now()
 	if now.Sub(runAt).Seconds() > 0 {
 		c.log(LogLevelError, "Requested job for %s has expired %s %v", channel, runAt.String(), args)
-		return errors.New(ErrorJobHasExpired)
+		return "", errors.New(ErrorJobHasExpired)
 	}
 
+	id := generateID(10)
 	job := &Job{
 		Channel: channel,
-		ID:      fmt.Sprintf("%s-%s", channel, generateID(10)),
+		ID:      id,
 		Args:    args,
 		RunAt:   runAt,
+		Status:  JobStatusActive,
 	}
 
 	c.log(LogLevelDebug, "New job published %v", job)
@@ -127,10 +138,10 @@ func (c *client) AddJob(channel string, runAt time.Time, args map[string]interfa
 	encoded, _ := json.Marshal(job)
 	if err := c.protocol.WriteCommand(command.Job(encoded)); err != nil {
 		c.log(LogLevelError, "Publish job %v", err)
-		return err
+		return "", err
 	}
 
-	return nil
+	return id, nil
 
 }
 
@@ -143,6 +154,29 @@ func (c *client) Close() {
 	c.log(LogLevelInfo, "Closing client...")
 
 	c.protocol.Close()
+}
+
+// Remove job based on id and channel name
+func (c *client) RemoveJob(channel, id string) error {
+	if atomic.LoadInt32(&c.closeFlag) == 1 {
+		return errors.New(ErrorClosedConnection)
+	}
+
+	if !isAlphaNumeric(channel) {
+		return errors.New(ErrorInvalidChannelName)
+	}
+
+	if id == "" {
+		return errors.New(ErrorInvalidJobID)
+	}
+
+	// Send Remove command to Scheduler
+	if err := c.protocol.WriteCommand(command.Remove(channel, id)); err != nil {
+		c.log(LogLevelError, "Remove job %s %s %v", channel, id, err)
+		return err
+	}
+
+	return nil
 }
 
 func (c *client) log(lvl LogLevel, line string, args ...interface{}) {
