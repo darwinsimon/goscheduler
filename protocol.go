@@ -124,7 +124,7 @@ writeCommandExit:
 	if err != nil {
 		p.log(LogLevelError, "%s", err)
 		if p.delegator != nil {
-			p.delegator.OnIOError(p.index)
+			go p.delegator.OnIOError(p.index)
 		}
 	}
 

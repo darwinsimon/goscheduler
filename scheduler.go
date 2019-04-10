@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
@@ -67,8 +68,6 @@ type clientConn struct {
 	index    int
 	channels []string
 	protocol *Protocol
-
-	closeChan chan bool
 }
 
 // SchedulerConfig contains every configuration to create a new Scheduler
@@ -146,11 +145,16 @@ func (s *scheduler) Stop() {
 	s.listener.Close()
 	s.routineWG.Wait()
 
+	clientIndexes := []int{}
 	s.clientsMtx.Lock()
 	for i := range s.clients {
-		go s.closeClientConn(i)
+		clientIndexes = append(clientIndexes, i)
 	}
 	s.clientsMtx.Unlock()
+
+	for _, v := range clientIndexes {
+		go s.closeClientConn(v)
+	}
 
 	s.clientsWG.Wait()
 
@@ -160,23 +164,25 @@ func (s *scheduler) Stop() {
 func (s *scheduler) closeClientConn(i int) {
 
 	s.clientsMtx.Lock()
-	defer s.clientsMtx.Unlock()
 
-	if s.clients[i] == nil {
+	selectedConn := s.clients[i]
+
+	if selectedConn == nil {
+		s.clientsMtx.Unlock()
 		return
 	}
 
+	delete(s.clients, i)
+	s.clientsMtx.Unlock()
+
 	s.clientMapMtx.Lock()
-	for _, channelName := range s.clients[i].channels {
+	for _, channelName := range selectedConn.channels {
 		s.clientMap[channelName].RemoveByValue(i)
 	}
-
 	s.clientMapMtx.Unlock()
 
-	s.clients[i].protocol.Close()
-	s.clients[i].closeChan <- true
+	selectedConn.protocol.Close()
 
-	delete(s.clients, i)
 	s.clientsWG.Done()
 
 }
@@ -191,9 +197,7 @@ func (s *scheduler) initializeStorageJobs() error {
 
 	now := time.Now()
 
-	if len(activeJobs) > 0 {
-		s.log(LogLevelInfo, "Initializing with %d jobs from storage", len(activeJobs))
-	}
+	var totalJobs int
 
 	for j := range activeJobs {
 
@@ -201,8 +205,13 @@ func (s *scheduler) initializeStorageJobs() error {
 		if now.Sub(activeJobs[j].RunAt).Seconds() > 0 {
 			continue
 		}
+		totalJobs++
 
 		s.insertToMap(activeJobs[j])
+	}
+
+	if totalJobs > 0 {
+		s.log(LogLevelInfo, "Initialized with %d jobs from storage", totalJobs)
 	}
 
 	return nil
@@ -280,6 +289,7 @@ func (s *scheduler) runTimer() {
 							go s.processJob(jobs[j])
 						}
 					}
+					s.log(LogLevelDebug, "Processed %d jobs for time %s", len(jobs), currentKey)
 
 				}(jbs)
 			}
@@ -298,32 +308,50 @@ func (s *scheduler) insertToMap(job *Job) (isNewBatch bool) {
 
 	batchKey := job.RunAt.Format(batchTimeLayout)
 
+	wg := sync.WaitGroup{}
+	wg.Add(3)
+
 	// Check for new batch
-	s.batchMapMtx.Lock()
-	if _, ok := s.batchMap[batchKey]; !ok {
-		s.batchMap[batchKey] = true
+	go func() {
+		s.batchMapMtx.Lock()
+		if _, ok := s.batchMap[batchKey]; !ok {
+			s.batchMap[batchKey] = true
 
-		// Insert new batch
-		s.runAtKeys = append(s.runAtKeys, batchKey)
+			// Insert new batch
+			s.runAtKeys = append(s.runAtKeys, batchKey)
 
-		// Sort by the nearest schedule
-		sort.Strings(s.runAtKeys)
+			// Sort by the nearest schedule
+			sort.Strings(s.runAtKeys)
 
-		isNewBatch = true
-	}
-	s.batchMapMtx.Unlock()
+			isNewBatch = true
+		}
+		s.batchMapMtx.Unlock()
 
-	// Insert to job map
-	s.jobByTimeMapMtx.Lock()
-	if _, ok := s.jobByTimeMap[batchKey]; !ok {
-		s.jobByTimeMap[batchKey] = []*Job{}
-	}
-	s.jobByTimeMap[batchKey] = append(s.jobByTimeMap[batchKey], job)
-	s.jobByTimeMapMtx.Unlock()
+		wg.Done()
+	}()
 
-	s.jobChannelMapMtx.Lock()
-	s.jobChannelMap[job.Channel+" "+job.ID] = job
-	s.jobChannelMapMtx.Unlock()
+	// Insert to jobByTimeMap
+	go func() {
+		s.jobByTimeMapMtx.Lock()
+		if _, ok := s.jobByTimeMap[batchKey]; !ok {
+			s.jobByTimeMap[batchKey] = []*Job{}
+		}
+		s.jobByTimeMap[batchKey] = append(s.jobByTimeMap[batchKey], job)
+		s.jobByTimeMapMtx.Unlock()
+
+		wg.Done()
+	}()
+
+	// Insert to jobChannelMap
+	go func() {
+		s.jobChannelMapMtx.Lock()
+		s.jobChannelMap[job.Channel+" "+job.ID] = job
+		s.jobChannelMapMtx.Unlock()
+
+		wg.Done()
+	}()
+
+	wg.Wait()
 
 	return
 
@@ -345,7 +373,6 @@ func (s *scheduler) processJob(job *Job) {
 
 	// No client is available
 	if err != nil {
-		s.log(LogLevelError, "Get client index %v", err)
 		return
 	}
 
@@ -364,7 +391,7 @@ func (s *scheduler) startAcceptingClients() {
 	s.routineWG.Add(1)
 
 	for {
-
+		log.Println("Start accepting")
 		// Listen for new connection
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -379,12 +406,11 @@ func (s *scheduler) startAcceptingClients() {
 
 		newIndex := int(atomic.AddInt32(&s.totalClients, 1))
 
-		s.log(LogLevelInfo, "New worker at %s", conn.RemoteAddr().String())
+		s.log(LogLevelInfo, "New client at %s", conn.RemoteAddr().String())
 
 		// Create new client
 		newClient := &clientConn{
-			index:     newIndex,
-			closeChan: make(chan bool),
+			index: newIndex,
 			protocol: newProtocol(ProtocolConfig{
 				Conn:      conn,
 				Index:     newIndex,
@@ -547,18 +573,14 @@ func (c *clientConn) sendHeartbeat() {
 
 		select {
 		case <-ticker.C:
-
 			if err := c.protocol.WriteCommand(command.Heartbeat()); err != nil {
-				goto exitLoop
+				goto exitHeartbeat
 			}
 
-		case <-c.closeChan:
-			goto exitLoop
 		}
 	}
 
-exitLoop:
-
+exitHeartbeat:
 	ticker.Stop()
 
 }

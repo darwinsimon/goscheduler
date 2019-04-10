@@ -53,16 +53,18 @@ func main() {
 		}
 		defer pb.Close()
 
-		id, _ := pb.AddJob("dead_channel", time.Now().Add(2*time.Second), map[string]interface{}{
+		id, _ := pb.AddJob("dead_channel", time.Now().Add(4*time.Second), map[string]interface{}{
 			"a": "b",
 		})
 
-		pb.RemoveJob("dead_channel", id)
-
+		go func() {
+			time.Sleep(2 * time.Second)
+			pb.RemoveJob("dead_channel", id)
+		}()
 		// Insert new job
-		for i := 1; i <= 10000; i++ {
+		for i := 1; i <= 50000; i++ {
 
-			pb.AddJob("do_something", time.Now().Add(4*time.Second), map[string]interface{}{
+			pb.AddJob("do_something", time.Now().Add(3*time.Second), map[string]interface{}{
 				"c": fmt.Sprintf("%d", i),
 			})
 
@@ -75,11 +77,9 @@ func main() {
 			for {
 				select {
 				case <-ticker.C:
-
-					//	pb.AddJob("do_something", time.Now().Add(time.Second), map[string]interface{}{
-					//		"c": fmt.Sprintf("%d", 99999999),
-					//	})
-
+					pb.AddJob("do_something", time.Now().Add(time.Second), map[string]interface{}{
+						"c": fmt.Sprintf("%d", 99999999),
+					})
 				}
 			}
 		}()
