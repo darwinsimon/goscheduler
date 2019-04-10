@@ -14,33 +14,13 @@ import (
 func main() {
 
 	var workerOnly bool
-	var producerOnly bool
 	flag.BoolVar(&workerOnly, "worker", false, "Worker only")
-	flag.BoolVar(&producerOnly, "producer", false, "Producer only")
 
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	if !workerOnly && !producerOnly {
-
-		// Scheduler config
-		config := goscheduler.SchedulerConfig{
-
-			Address: ":7000",
-
-			Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
-			LogLvl: goscheduler.LogLevelDebug,
-		}
-
-		// Create scheduler instance
-		sc, err := goscheduler.NewScheduler(config)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer sc.Stop()
-
-	} else if workerOnly {
+	if workerOnly {
 
 		// Create workers
 		config := goscheduler.ClientConfig{
@@ -57,14 +37,14 @@ func main() {
 		log.Println(worker.Listen("do_something", doSomething))
 		defer worker.Close()
 
-	} else if producerOnly {
+	} else {
 
 		config := goscheduler.ClientConfig{
 
 			Address: ":7000",
 
-			//Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
-			//LogLvl: goscheduler.LogLevelDebug,
+			Logger: log.New(os.Stderr, "", log.LstdFlags|log.Llongfile),
+			LogLvl: goscheduler.LogLevelDebug,
 		}
 
 		pb, err := goscheduler.NewClient(config)
@@ -80,7 +60,7 @@ func main() {
 		pb.RemoveJob("dead_channel", id)
 
 		// Insert new job
-		for i := 1; i <= 100000; i++ {
+		for i := 1; i <= 10000; i++ {
 
 			pb.AddJob("do_something", time.Now().Add(4*time.Second), map[string]interface{}{
 				"c": fmt.Sprintf("%d", i),

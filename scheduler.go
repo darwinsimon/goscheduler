@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"strings"
@@ -192,6 +191,10 @@ func (s *scheduler) initializeStorageJobs() error {
 
 	now := time.Now()
 
+	if len(activeJobs) > 0 {
+		s.log(LogLevelInfo, "Initializing with %d jobs from storage", len(activeJobs))
+	}
+
 	for j := range activeJobs {
 
 		// Validate expired time
@@ -334,7 +337,6 @@ func (s *scheduler) processJob(job *Job) {
 
 	// No channel is registered
 	if !ok || job.Status != JobStatusActive {
-		log.Println(job)
 		return
 	}
 
@@ -451,7 +453,7 @@ func (s *scheduler) removeJob(channel, id string) {
 		s.jobChannelMapMtx.Unlock()
 
 		if s.storage != nil {
-			if err := s.storage.RemoveJob(job); err != nil {
+			if err := s.storage.RemoveJob(channel, id); err != nil {
 				s.log(LogLevelError, "Remove job %s %s %v", channel, id, err)
 			} else {
 				s.log(LogLevelDebug, "Removed job %s %s", channel, id)

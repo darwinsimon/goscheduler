@@ -28,32 +28,32 @@ func (s *testStorage) GetActiveJobs() ([]*Job, error) {
 
 	return jobs, nil
 }
-func (s *testStorage) GetJob(id string) (job *Job, err error) {
+func (s *testStorage) GetJob(channel, id string) (job *Job, err error) {
 	return nil, nil
 }
 func (s *testStorage) InsertJob(job *Job) error {
 	return nil
 }
-func (s *testStorage) SetJobAsFinished(id string) error {
+func (s *testStorage) SetJobAsFinished(channel, id string) error {
 	return nil
 }
-func (s *testStorage) RemoveJob(job *Job) error {
+func (s *testStorage) RemoveJob(channel, id string) error {
 	return nil
 }
 
 func (s *testStorageErr) GetActiveJobs() ([]*Job, error) {
 	return nil, errors.New("foo")
 }
-func (s *testStorageErr) GetJob(id string) (job *Job, err error) {
+func (s *testStorageErr) GetJob(channel, id string) (job *Job, err error) {
 	return nil, errors.New("foo")
 }
 func (s *testStorageErr) InsertJob(job *Job) error {
 	return errors.New("foo")
 }
-func (s *testStorageErr) SetJobAsFinished(id string) error {
+func (s *testStorageErr) SetJobAsFinished(channel, id string) error {
 	return errors.New("foo")
 }
-func (s *testStorageErr) RemoveJob(job *Job) error {
+func (s *testStorageErr) RemoveJob(channel, id string) error {
 	return nil
 }
 
