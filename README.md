@@ -1,10 +1,10 @@
-# GoScheduler - Under Development
+# GoScheduler
 
 Inspired by https://github.com/gocraft/work and https://github.com/nsqio/go-nsq, GoScheduler is a simple scheduler for Golang. It uses TCP connection to communicate between scheduler and client. 
 
 
 ## Scheduler
-Scheduler service serves as the main gateway for receiving and pushing jobs. You could add storage to save preserve jobs.
+Scheduler service serves as the main gateway for receiving and pushing jobs. You could add storage to save your jobs.
 
 ```golang
 
@@ -22,7 +22,7 @@ Scheduler service serves as the main gateway for receiving and pushing jobs. You
 	// Create scheduler instance
 	sc, err := goscheduler.NewScheduler(config)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 	defer sc.Stop()
 
@@ -76,4 +76,4 @@ Client service serves as the job producer or consumer.
 ```
 
 ## Storage
--
+Optional backup system for scheduler. You can build your own and save it anywhere (database, memory, file, etc)

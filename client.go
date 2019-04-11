@@ -86,7 +86,7 @@ func (c *client) Listen(channel string, f ClientCallbackFunc) error {
 		return errors.New(ErrorClosedConnection)
 	}
 
-	if !isAlphaNumeric(channel) {
+	if !isValidChannelName(channel) {
 		return errors.New(ErrorInvalidChannelName)
 	}
 
@@ -109,7 +109,7 @@ func (c *client) AddJob(channel string, runAt time.Time, args map[string]interfa
 		return "", errors.New(ErrorClosedConnection)
 	}
 
-	if !isAlphaNumeric(channel) {
+	if !isValidChannelName(channel) {
 		return "", errors.New(ErrorInvalidChannelName)
 	}
 
@@ -162,7 +162,7 @@ func (c *client) RemoveJob(channel, id string) error {
 		return errors.New(ErrorClosedConnection)
 	}
 
-	if !isAlphaNumeric(channel) {
+	if !isValidChannelName(channel) {
 		return errors.New(ErrorInvalidChannelName)
 	}
 

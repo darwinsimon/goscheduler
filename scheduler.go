@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"strings"
@@ -391,7 +390,7 @@ func (s *scheduler) startAcceptingClients() {
 	s.routineWG.Add(1)
 
 	for {
-		log.Println("Start accepting")
+
 		// Listen for new connection
 		conn, err := s.listener.Accept()
 		if err != nil {
