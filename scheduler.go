@@ -121,8 +121,9 @@ func NewScheduler(config SchedulerConfig) (Scheduler, error) {
 		return nil, errors.New(ErrorNewConnection)
 	}
 
-	go s.runTimer()
+	s.routineWG.Add(2)
 
+	go s.runTimer()
 	go s.startAcceptingClients()
 
 	return s, nil
@@ -217,8 +218,6 @@ func (s *scheduler) initializeStorageJobs() error {
 }
 
 func (s *scheduler) runTimer() {
-
-	s.routineWG.Add(1)
 
 	for {
 
@@ -386,8 +385,6 @@ func (s *scheduler) processJob(job *Job) {
 }
 
 func (s *scheduler) startAcceptingClients() {
-
-	s.routineWG.Add(1)
 
 	for {
 

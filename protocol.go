@@ -111,7 +111,7 @@ func (p *Protocol) WriteCommand(cmd *command.Command) error {
 	}
 
 	p.writeMtx.Lock()
-	_, err := cmd.WriteTo(p)
+	_, err := cmd.Write(p)
 	if err != nil {
 		goto writeCommandExit
 	}
@@ -167,7 +167,7 @@ func (p *Protocol) readLoop() {
 			}
 		case command.StreamTypeJob:
 			if p.delegator != nil {
-				// p.log(LogLevelDebug, "Received job stream %s", string(data))
+				p.log(LogLevelDebug, "Received job stream %s", string(data))
 				p.delegator.OnJobReceived(data)
 			}
 		default:

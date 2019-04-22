@@ -77,7 +77,7 @@ func TestProtocolReadResponse(t *testing.T) {
 		sw := snappy.NewWriter(w)
 
 		hb := command.Heartbeat()
-		hb.WriteTo(sw)
+		hb.Write(sw)
 
 		sw.Close()
 	}()
@@ -124,22 +124,22 @@ func TestProtocolReadLoop(t *testing.T) {
 
 		for i := 0; i < 1000; i++ {
 			foo := command.Register("foo")
-			foo.WriteTo(sw)
+			foo.Write(sw)
 		}
 
 		for i := 0; i < 10; i++ {
 			hb := command.Heartbeat()
-			hb.WriteTo(sw)
+			hb.Write(sw)
 		}
 
 		for i := 0; i < 1000; i++ {
 			job := command.Job([]byte("data"))
-			job.WriteTo(sw)
+			job.Write(sw)
 		}
 
 		unknown := command.Heartbeat()
 		unknown.Type = byte('A')
-		unknown.WriteTo(sw)
+		unknown.Write(sw)
 
 		sw.Close()
 

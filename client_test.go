@@ -92,7 +92,7 @@ func TestClientOnJobReceived(t *testing.T) {
 		w := snappy.NewWriter(conn)
 
 		for _, tc := range tcs {
-			tc.cmd.WriteTo(w)
+			tc.cmd.Write(w)
 		}
 
 		exitChan <- true

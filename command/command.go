@@ -27,7 +27,7 @@ type Command struct {
 	Type byte
 }
 
-func (c *Command) WriteTo(w io.Writer) (int, error) {
+func (c *Command) Write(w io.Writer) (int, error) {
 
 	var size int32 = 1
 

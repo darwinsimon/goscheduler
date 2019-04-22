@@ -24,7 +24,7 @@ func (w *errorWriter) Write(p []byte) (n int, err error) {
 	return 0, nil
 }
 
-func TestWriteTo(t *testing.T) {
+func TestWrite(t *testing.T) {
 
 	tcs := []struct {
 		name   string
@@ -118,7 +118,7 @@ func TestWriteTo(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			total, err := tc.cmd.WriteTo(tc.writer)
+			total, err := tc.cmd.Write(tc.writer)
 
 			assert.Equal(t, tc.total, total)
 			assert.Equal(t, tc.err, err)
